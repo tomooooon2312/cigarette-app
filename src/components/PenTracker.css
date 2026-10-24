@@ -1,0 +1,494 @@
+.pen-tracker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .pen-tracker {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.stage {
+  position: relative;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+}
+
+/* display:none だと iOS Safari でフレームが更新されないことがあるため不可視化に留める */
+.source-video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.output-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.stage-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  color: #bbb;
+  text-align: center;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.panel section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.panel h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.pen-tracker button {
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.pen-tracker button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.segmented {
+  display: inline-flex;
+}
+
+.segmented button {
+  border-radius: 0;
+}
+
+.segmented button:first-child {
+  border-radius: 6px 0 0 6px;
+}
+
+.segmented button:last-child {
+  border-radius: 0 6px 6px 0;
+  border-left: none;
+}
+
+.segmented button[aria-pressed='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.pen-tracker button.link {
+  border: none;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.checkbox {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 14px;
+}
+
+.slider {
+  display: grid;
+  grid-template-columns: 96px 1fr 48px;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+
+.slider output {
+  text-align: right;
+  font-family: var(--mono);
+}
+
+.hue-swatches {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.hue-swatches span {
+  width: 24px;
+  height: 12px;
+  border-radius: 3px;
+}
+
+.readout {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 2px 8px;
+  margin: 0;
+  font-size: 14px;
+}
+
+.readout dt {
+  color: var(--text);
+}
+
+.readout dd {
+  margin: 0;
+  color: var(--text-h);
+  font-family: var(--mono);
+}
+
+.note {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+
+.error {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(244, 67, 54, 0.12);
+  color: #e53935;
+  font-size: 14px;
+}
+
+/* STEP 3.1: 煙の状態表示とスコアメーター */
+.smoke-badge {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font: 600 13px var(--mono);
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.smoke-badge.state-smoking {
+  background: rgba(230, 81, 0, 0.85);
+}
+
+.smoke-badge.state-exhaling {
+  background: rgba(2, 136, 209, 0.85);
+}
+
+.score-meter {
+  display: grid;
+  grid-template-columns: 92px 1fr 40px;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.score-meter output {
+  text-align: right;
+  font-family: var(--mono);
+}
+
+.score-bar {
+  position: relative;
+  height: 10px;
+  border-radius: 5px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.score-bar .fill {
+  height: 100%;
+  background: var(--text);
+}
+
+.score-bar .fill.over {
+  background: var(--accent);
+}
+
+.score-bar .threshold {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--text-h);
+}
+
+/* スマートフォン：タップしやすい大きさにする */
+@media (max-width: 860px) {
+  .pen-tracker button {
+    min-height: 40px;
+    padding: 8px 14px;
+  }
+
+  .slider {
+    grid-template-columns: 96px 1fr 52px;
+    min-height: 40px;
+  }
+
+  .slider input[type='range'] {
+    height: 28px;
+  }
+
+  .checkbox {
+    min-height: 40px;
+  }
+
+  .checkbox input {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+/* STEP 3.2: 煙のプリセット */
+.panel h3 {
+  margin: 12px 0 6px;
+  font-size: 14px;
+  color: var(--text-h);
+}
+
+.segmented.preset {
+  display: flex;
+  margin-bottom: 6px;
+}
+
+.segmented.preset button {
+  flex: 1;
+  padding-inline: 6px;
+}
+
+/* STEP 4: 着火・炎 */
+.stage-badges {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.stage-badges .smoke-badge {
+  position: static;
+}
+
+.smoke-badge.ignition-lit {
+  background: rgba(211, 47, 47, 0.9);
+}
+
+.smoke-badge.flame-on {
+  background: rgba(255, 143, 0, 0.9);
+}
+
+.fire-actions button {
+  flex: 1 1 auto;
+}
+
+.pen-tracker button.lighter-button {
+  width: 100%;
+  margin: 8px 0;
+  padding: 12px;
+  font-weight: 600;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.pen-tracker button.lighter-button.pressed {
+  background: #ff6d00;
+  border-color: #ff6d00;
+  color: #fff;
+}
+
+/* STEP 5: 複数人 */
+.smoke-badge.person-badge {
+  border: 2px solid transparent;
+}
+
+.person-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.person-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: 13px;
+}
+
+.person-id {
+  font: 700 14px var(--mono);
+}
+
+.person-state {
+  padding: 1px 6px;
+  border-radius: 6px;
+  font: 600 12px var(--mono);
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.person-state.ignition-lit {
+  color: #fff;
+  background: rgba(211, 47, 47, 0.9);
+}
+
+.person-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.person-actions button {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.person-debug {
+  flex-basis: 100%;
+  font: 12px var(--mono);
+  opacity: 0.8;
+}
+
+/* STEP 6: ペンの色・CG */
+.output-canvas.picking {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.pick-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.7);
+  font-size: 14px;
+  pointer-events: none;
+}
+
+.color-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.color-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 6px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.color-chip.selected {
+  border-color: currentColor;
+}
+
+.color-chip button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  border: none;
+  background: transparent;
+}
+
+.color-chip input[type='checkbox'] {
+  width: 20px;
+  height: 20px;
+}
+
+.swatch {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.3);
+}
+
+.swatch.large {
+  width: 32px;
+  height: 32px;
+}
+
+.color-chip .tag {
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #fff;
+  background: #9e9e9e;
+}
+
+.pending-color {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.pending-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.text-field {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.text-field input {
+  min-height: 36px;
+  padding: 4px 8px;
+  font-size: 16px; /* iOS で入力時に拡大されないよう 16px 以上 */
+}
