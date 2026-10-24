@@ -22,3 +22,29 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# 環境変数・認証情報（GitHub に含めない）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+.npmrc
+
+# Python（検証用スクリプトを使う場合の仮想環境・キャッシュ）
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# 一時ファイル・キャッシュ・テスト結果
+*.tmp
+*.tsbuildinfo
+coverage/
+.cache/
+.eslintcache
+
+# 試験用の生成物（YOLOE のモデル・評価データ。STEP 7 は不採用）
+tools/yoloe/
+public/models/yoloe/
