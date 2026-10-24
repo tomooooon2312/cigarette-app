@@ -3,6 +3,8 @@ import wasmBinaryUrl from '@mediapipe/tasks-vision/vision_wasm_internal.wasm?url
 import noSimdLoaderUrl from '@mediapipe/tasks-vision/vision_wasm_nosimd_internal.js?url'
 import noSimdBinaryUrl from '@mediapipe/tasks-vision/vision_wasm_nosimd_internal.wasm?url'
 
+import { blockMediaPipeTelemetry } from './telemetryGuard'
+
 type VisionModule = typeof import('@mediapipe/tasks-vision')
 type WasmFileset = { wasmLoaderPath: string; wasmBinaryPath: string }
 
@@ -14,6 +16,8 @@ let loading: Promise<{ vision: VisionModule; fileset: WasmFileset }> | null = nu
  */
 export function loadVision(): Promise<{ vision: VisionModule; fileset: WasmFileset }> {
   loading ??= (async () => {
+    // MediaPipe が作る利用統計のロガーの送信を止める（telemetryGuard.ts）
+    blockMediaPipeTelemetry()
     const vision = await import('@mediapipe/tasks-vision')
     const simd = await vision.FilesetResolver.isSimdSupported()
     const fileset = simd

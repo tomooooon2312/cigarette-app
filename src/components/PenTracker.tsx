@@ -359,7 +359,9 @@ export function PenTracker() {
       const fireSettings = fireSettingsRef.current
       // STEP 5：人数に応じて処理解像度と推論間隔を調整する（1 人モードは従来どおり）
       const perf = effectivePerf(mode, autoPerfRef.current, smokeSettings.inferenceIntervalMs, fireSettings.handIntervalMs)
-      const scale = Math.min(1, perf.maxProcessWidth / video.videoWidth)
+      // 処理解像度は「長い辺」を上限に縮める（iOS 対応：縦向きの iPhone のカメラは 720×1280 などになり、
+      // 幅だけで縮めると横向きの約 3 倍の画素を処理してしまうため。横長の映像では従来と同じ）
+      const scale = Math.min(1, perf.maxProcessWidth / Math.max(video.videoWidth, video.videoHeight))
       const width = Math.round(video.videoWidth * scale)
       const height = Math.round(video.videoHeight * scale)
       if (canvas.width !== width || canvas.height !== height) {
@@ -741,7 +743,11 @@ export function PenTracker() {
 
   return (
     <div className="pen-tracker">
-      <div className="stage">
+      {/* 映像の比率に枠を合わせる（iOS 対応：縦向きの iPhone で映像が小さくならないように。起動前は 16:9） */}
+      <div
+        className="stage"
+        style={stats.frameWidth > 0 && stats.frameHeight > 0 ? { aspectRatio: `${stats.frameWidth} / ${stats.frameHeight}` } : undefined}
+      >
         <video ref={videoRef} className="source-video" playsInline muted />
         <canvas
           ref={canvasRef}

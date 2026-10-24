@@ -56,6 +56,16 @@
 
 body {
   margin: 0;
+  /* iOS 対応：ページ全体のバウンス（引っ張りすぎ）で映像が動かないようにする */
+  overscroll-behavior: none;
+}
+
+/* iOS 対応：ボタン・スライダーのダブルタップでの拡大と、タップ時のハイライトを抑える */
+button,
+input,
+label {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
 h1,

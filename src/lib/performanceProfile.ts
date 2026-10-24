@@ -8,7 +8,7 @@ import type { PersonMode } from './personController'
  * 値は PC の headless Chrome での計測から決めた暫定値で、スマートフォンの実機では未調整。
  */
 export type PerfProfile = {
-  /** 処理解像度の上限幅 px */
+  /** 処理解像度の上限 px（映像の長い辺。横長の映像では幅） */
   maxProcessWidth: number
   /** 顔の推論間隔の下限 ms */
   minFaceIntervalMs: number

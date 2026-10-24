@@ -22,15 +22,21 @@
 - OpenCV.js（`@techstark/opencv-js`）：ペン・ライターの認識
 - MediaPipe Tasks Vision（`@mediapipe/tasks-vision`）：顔（Face Landmarker）と手（Hand Landmarker）の認識。モデルは `public/models/` に同梱
 - Canvas 2D：タバコ CG・炎・煙の描画
+- Capacitor 8：iOS アプリ化（中身は同じ Web 版を WKWebView で動かす）
 - oxlint（Lint）、Node.js 標準の `node:test`（単体テスト）
 
-画像の処理と推論は**すべてブラウザ内**で行い、カメラの映像を外部に送信しません。
+画像の処理と推論は**すべて端末内**で行い、カメラの映像を外部に送信しません。
+
+- MediaPipe（1.1.1）が自動で行う利用統計の送信（`odml.pa.googleapis.com`）も止めています（`src/lib/telemetryGuard.ts`）。
+- 利用統計には映像は含まれません。
 
 ## ディレクトリ構成
 
 ```
 cigarette-app/
+├── capacitor.config.ts      iOS アプリ（Capacitor）の設定
 ├── docs/TECH_SPEC.md        技術仕様書（設計・アルゴリズム・検証状況・既知の制約・変更履歴）
+├── ios/                     iOS アプリの Xcode プロジェクト（ios/App/App.xcodeproj）
 ├── public/models/           MediaPipe のモデル（face_landmarker.task / hand_landmarker.task）
 ├── src/
 │   ├── components/          画面（PenTracker.tsx：カメラ・描画ループ・設定 UI）
@@ -71,9 +77,31 @@ npm run dev
 表示された `http://localhost:5173/` をブラウザで開き、「カメラ起動」を押してカメラの使用を許可します。
 
 - 初回は OpenCV.js（約 13MB）と MediaPipe の読み込みに数秒かかります。
-- **スマートフォン**：
+- **スマートフォンのブラウザ**：
   - 同じネットワークの PC から開くと `http://` になるため、カメラを使えません。
-  - HTTPS で配信する設定は、まだ用意していません。
+  - HTTPS で配信する設定は、まだ用意していません。iPhone では、下の iOS アプリを使います。
+
+## iOS アプリ（Capacitor）
+
+必要なもの：macOS、Xcode（27.0 で確認）、iPhone（iOS 16.4 以上）、Apple アカウント（無料のアカウントでも自分の iPhone へのインストールは可能）。
+
+```sh
+npm install
+npm run ios:sync    # Web 版をビルドして ios/App/App/public にコピー（npm run build && npx cap sync ios）
+npm run ios:open    # Xcode でプロジェクトを開く（npx cap open ios）
+```
+
+Xcode での手順：
+
+1. Xcode で **App** ターゲットの **Signing & Capabilities** を開き、**Team** に自分の Apple アカウント（Personal Team など）を選ぶ。
+   - **Bundle Identifier**（既定は `io.github.towadachibatech.shibugarette`）が他と重複していると言われたら、自分用の値に変える。
+2. iPhone を USB で接続し、iPhone 側で **設定 → プライバシーとセキュリティ → デベロッパモード** をオンにする（初回のみ。再起動が必要）。
+3. Xcode の上部の実行先に自分の iPhone を選び、▶（Run）を押す。
+4. 初回は iPhone 側で **設定 → 一般 → VPN とデバイス管理** から、自分の開発元を信頼する。
+5. アプリを開き、「カメラ起動」を押して、カメラの使用を許可する。
+
+- Web のコードを変えたら、`npm run ios:sync` をやり直してから Xcode で Run します。
+- OpenCV.js・MediaPipe の WASM とモデルはアプリに同梱しているので、オフラインでも動く想定です（未確認）。
 
 ## ビルド・テスト
 
@@ -81,7 +109,7 @@ npm run dev
 npm run build     # 型チェック（tsc）と本番ビルド（dist/ に出力）
 npm run preview   # ビルド結果をローカルで確認
 npm run lint      # oxlint
-npm test          # 単体テスト（151 件）
+npm test          # 単体テスト（152 件）
 ```
 
 ## 現在の実装状況
@@ -94,10 +122,11 @@ npm test          # 単体テスト（151 件）
 | 4 | 指パッチン・ライターによる着火、炎 | 実装済み・自動テスト済み・実機未検証（**指パッチンは実際の手で未確認**） |
 | 5 | 複数人の同時認識 | 実装済み・自動テスト済み・実機未検証（実際の 2〜3 人では未確認） |
 | 6 | 複数色のペン認識、形状による誤認識の防止、色の登録、葉巻・パイプの CG | 実装済み・自動テスト済み・実機未検証（黒・白・グレーのペンは未対応（実験的）） |
+| 8 | iOS アプリ化（Capacitor） | 実装済み・Xcode でのビルドとシミュレーターでの起動を確認・**iPhone 実機では未確認**（カメラ・認識・性能も未確認） |
 | 7 | YOLOE（機械学習モデル）によるペン認識 | 試験したが**不採用**（推論の遅れで CG がずれるため）。アプリには含まない |
 | 今後 | ペンの先端・後端の判定、指の前後関係、元のペンを消す処理、スマートフォンでの最適化 | 未着手 |
 
-「自動テスト済み」は、単体テストと、Chrome の仮想カメラに合成動画・写真を入力したブラウザのテストで確認したという意味です。詳細は技術仕様書の第 10 章を参照してください。
+「自動テスト済み」は、単体テストと、Chrome の仮想カメラに合成動画・写真を入力したブラウザのテストで確認したという意味です。詳細は技術仕様書の第 11 章を参照してください。
 
 ## 既知の制約
 
@@ -106,8 +135,8 @@ npm test          # 単体テスト（151 件）
 - 色と形でペンを認識するので、同じ色で細長い物（ストライプの服・ケーブルなど）をペンと誤認識することがあります。
 - 吐く動作は口の形（口すぼめ）で判定する擬似的なもので、実際の息は検出しません。
 - 処理はすべて 2D で、奥行きは考慮しません。
-- スマートフォンでの動作・性能は未確認です。
-- その他の制約は、技術仕様書の第 11 章にまとめています。
+- スマートフォン（iOS アプリを含む）での動作・性能は未確認です。iOS アプリは、バックグラウンドから戻ると「カメラ起動」を押し直す必要がある見込みです。
+- その他の制約は、技術仕様書の第 12 章にまとめています。
 
 ## 技術仕様書
 

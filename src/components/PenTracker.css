@@ -17,6 +17,12 @@
   border-radius: 8px;
   overflow: hidden;
   aspect-ratio: 16 / 9;
+  /* 縦長の映像（縦向きの iPhone）で、操作パネルが画面外に押し出されないよう高さを抑える（余りは左右の黒帯） */
+  max-height: 75svh;
+  /* 映像の長押しで文字選択・コピーのメニューが出ないようにする（タップで色を拾う操作のため） */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 /* display:none だと iOS Safari でフレームが更新されないことがあるため不可視化に留める */
