@@ -1,3 +1,4 @@
+import { BURN_MAX_FRACTION } from './cigaretteLife'
 import type { Point2 } from './penGeometry'
 import type { TrackedPen } from './penTracking'
 
@@ -78,6 +79,82 @@ const OCCLUSION_MEMORY_MS = 300
 
 type Gap = { from: number; to: number }
 
+/** STEP 10：葉巻の吸い口側の帯の端（全長に対する比率）。燃え進む範囲の基準 */
+const CIGAR_BAND_END = 0.26
+
+/**
+ * STEP 10：燃え進んだ割合（0〜1）から、燃え進んだ位置を求める（吸い口 0 → 火側 1 の比率）。パイプは変わらない。
+ * STEP 11：CG の全長は短くしない。この位置より火側は透明にせず、焦げた色の CG で覆う（burnLayout）。
+ */
+export function burnRingFraction(kind: CgKind, progress: number): number {
+  if (kind === 'pipe') return 1
+  const base = kind === 'cigar' ? CIGAR_BAND_END : FILTER_END
+  return 1 - Math.min(Math.max(progress, 0), 1) * BURN_MAX_FRACTION * (1 - base)
+}
+
+/**
+ * STEP 11：燃え具合の見た目の配置（吸い口 0 → 火側 1 の比率）。CG 本体は燃焼状態によらず常に 0〜1 を不透明に覆い、
+ * 燃え進んだ部分は焦げた色で上書きするだけ（ペンが見える透明な隙間を作らない）。灰は本体の外側（1 より先）に足す。
+ *   baseLength（CG の全長）= ペンの検出結果 × 拡大率（placeCigarette）。burnProgress・appearanceState では変えない
+ *   burnProgress = look.progress、appearanceState = NEW / BURNING / BUTT、ashLength = look.ash（外側）
+ */
+export type BurnLayout = {
+  /** CG 本体の範囲。常に 0〜1 */
+  bodyFrom: number
+  bodyTo: number
+  /** 焦げた色で覆う範囲の始まり（〜1）。焦げが無ければ 1 */
+  charFrom: number
+  /** 焦げの濃さ 0〜1（シケモクは 1） */
+  charLevel: number
+  /** 火側の端の灰の固まり（本体の内側、焦げの上に描く。シケモクで灰の質感を強調する）の長さ */
+  crust: number
+  /** 本体の外側に描く灰の長さ（全長に対する比率） */
+  ashOutside: number
+  /** 燃えている先端（赤い光）を描く */
+  ember: boolean
+}
+
+/** STEP 11：シケモクの、本体の外側に必ず残す灰の長さ（全長に対する比率） */
+export const BUTT_ASH_MIN = 0.03
+/** STEP 11：シケモクの火側の端の灰の固まり（本体の内側。全長に対する比率） */
+export const BUTT_CRUST = 0.07
+
+export function burnLayout(kind: CgKind, look: CigaretteLook, lit: boolean): BurnLayout {
+  if (kind === 'pipe') return { bodyFrom: 0, bodyTo: 1, charFrom: 1, charLevel: 0, crust: 0, ashOutside: 0, ember: lit && !look.butt }
+  const paperFrom = kind === 'cigar' ? CIGAR_BAND_END : FILTER_END
+  if (look.butt) {
+    // シケモク：フィルター（葉巻は帯）より火側の巻紙をすべて焦げ茶〜黒にする
+    return { bodyFrom: 0, bodyTo: 1, charFrom: paperFrom, charLevel: 1, crust: BUTT_CRUST, ashOutside: Math.max(look.ash, BUTT_ASH_MIN), ember: false }
+  }
+  const p = Math.min(Math.max(look.progress, 0), 1)
+  const ring = burnRingFraction(kind, p)
+  return {
+    bodyFrom: 0,
+    bodyTo: 1,
+    // 燃え始め（progress 0）でも、燃えている先端の少し手前から焦げを付ける
+    charFrom: lit || p > 0 ? Math.min(ring, 1 - CHAR_MIN) : 1,
+    charLevel: 0.45 + 0.55 * p,
+    crust: 0,
+    ashOutside: Math.max(look.ash, 0),
+    ember: lit,
+  }
+}
+
+/** STEP 11：燃えている・燃えたタバコの、焦げの最小の長さ（全長に対する比率） */
+const CHAR_MIN = 0.04
+
+/** STEP 10：タバコの燃え具合の見た目 */
+export type CigaretteLook = {
+  /** 燃え進んだ割合 0〜1 */
+  progress: number
+  /** 灰の長さ（全長に対する比率） */
+  ash: number
+  /** 灰を落とした直後の燃焼部分の光 0〜1 */
+  flash: number
+  /** シケモク */
+  butt: boolean
+}
+
 /** 画面上でのタバコ CG の配置 */
 export type CigarettePlacement = {
   center: Point2
@@ -87,7 +164,7 @@ export type CigarettePlacement = {
   thickness: number
   /** 吸い口側の端（口にくわえる側） */
   mouthEnd: Point2
-  /** 火側の端（パイプはボウル（火皿）の開口部の中心） */
+  /** 火側の端（パイプはボウル（火皿）の開口部の中心）。STEP 11：燃焼状態によらず CG の火側の端（灰は更にその外側） */
   emberEnd: Point2
   /** STEP 6：CG の種類 */
   kind: CgKind
@@ -98,6 +175,8 @@ export type CigarettePlacement = {
 /**
  * ペンの検出結果と CG 設定から、タバコ CG の配置を求める（描画・口元判定・煙の発生位置で共用）。
  * emberDir（吸い口 → 火 の向き、自動補正の結果）を渡すとその向きに合わせ、無ければ endpoints[0] 側を吸い口にする。
+ * STEP 11：全長・火側の端は燃焼状態（燃え進んだ割合・シケモク・灰）によらない（STEP 10 では燃えるほど短くしていた）。
+ * ペンの映像上の長さが変われば、従来どおり CG も伸び縮みする。
  */
 export function placeCigarette(
   pen: TrackedPen,
@@ -188,6 +267,7 @@ export class CigaretteRenderer {
     emberDir?: Point2 | null,
     lit = true,
     kind: CgKind = 'cigarette',
+    look?: CigaretteLook,
   ): void {
     const { width, height } = ctx.canvas
     if (this.layer.width !== width || this.layer.height !== height) {
@@ -214,7 +294,15 @@ export class CigaretteRenderer {
       // 回転後の座標で、ボウルが画面の上側に来る向き（-1 = ローカル座標の y の負の向き）
       const up = placement.bowlUp!
       const side = up.x * -dir.y + up.y * dir.x >= 0 ? 1 : -1
-      drawPipe(layer, cgLength, cgThickness, side, lit, now)
+      drawPipe(layer, cgLength, cgThickness, side, lit && !look?.butt, now)
+    } else if (look && (look.progress > 0 || look.butt || look.ash > 0 || lit)) {
+      // STEP 10：燃え具合（STEP 11：全長はそのまま、焦げた巻紙・燃えている先端・外側の灰・シケモクの焦げ）
+      let body = this.unlitSprite
+      if (kind === 'cigar') {
+        this.cigarSprites ??= { lit: createCigarSprite(true), unlit: createCigarSprite(false) }
+        body = this.cigarSprites.unlit
+      }
+      drawBurning(layer, body, kind, cgLength, cgThickness, lit && !look.butt, look, now)
     } else {
       let sprite = lit ? this.litSprite : this.unlitSprite
       if (kind === 'cigar') {
@@ -303,11 +391,152 @@ function cutOutGaps(
   layer.restore()
 }
 
-/** 火の先端の発光（STEP 4：着火済みのときだけ。赤く脈打つように揺らぐ） */
-function drawEmberGlow(ctx: CanvasRenderingContext2D, tipX: number, thickness: number, now: number) {
-  const flicker = 0.7 + 0.3 * Math.sin(now / 90) * Math.sin(now / 37)
+/**
+ * STEP 10：燃えているタバコ・葉巻（回転済みの座標。x：吸い口 −L/2 → 火側 +L/2）。
+ * STEP 11：本体（未着火のスプライト）は常に全長を描き、燃え進んだ部分はその上に不透明な焦げの色を重ねる
+ * （source-atop で本体の形の中だけに塗るので、本体からはみ出さず、透明にもならない）。
+ * 着火中は火側の端に燃えている部分（赤い光）、その外側に灰の柱を描く。シケモクは巻紙全体が焦げ茶〜黒になり、先端に灰の固まりが残る。
+ */
+export function drawBurning(
+  ctx: CanvasRenderingContext2D,
+  body: CanvasImageSource & { width: number; height: number },
+  kind: CgKind,
+  length: number,
+  thickness: number,
+  lit: boolean,
+  look: CigaretteLook,
+  now: number,
+) {
+  const layout = burnLayout(kind, look, lit)
+  const x0 = -length / 2
+  const xEnd = x0 + length * layout.bodyTo
+  // 本体（常に全長。燃焼状態で短くしない）
+  ctx.drawImage(body, 0, 0, body.width, body.height, x0 + length * layout.bodyFrom, -thickness / 2, length * (layout.bodyTo - layout.bodyFrom), thickness)
+  if (layout.charFrom < 1) {
+    const cx = x0 + length * layout.charFrom
+    const level = layout.charLevel
+    ctx.save()
+    ctx.globalCompositeOperation = 'source-atop'
+    const g = ctx.createLinearGradient(cx, 0, xEnd, 0)
+    // 焦げ：吸い口側は薄い焦げ茶、火側ほど黒い（不透明）
+    g.addColorStop(0, mixColor([196, 160, 112], [92, 58, 34], level))
+    g.addColorStop(0.12, mixColor([150, 104, 64], [70, 42, 24], level))
+    g.addColorStop(0.7, mixColor([88, 56, 32], [40, 26, 16], level))
+    g.addColorStop(1, mixColor([40, 26, 16], [14, 10, 8], level))
+    ctx.fillStyle = g
+    ctx.fillRect(cx, -thickness / 2, xEnd - cx, thickness)
+    // 焦げの境目のぎざぎざ（巻紙が燃えた跡）
+    ctx.fillStyle = mixColor([120, 82, 50], [60, 38, 22], level)
+    ctx.beginPath()
+    ctx.moveTo(cx + 0.5, -thickness / 2)
+    for (let i = 0; i <= 6; i++) {
+      const y = -thickness / 2 + (thickness * i) / 6
+      ctx.lineTo(cx - thickness * (0.1 + 0.22 * Math.abs(Math.sin(i * 2.3 + 1.1))), y)
+    }
+    ctx.lineTo(cx + 0.5, thickness / 2)
+    ctx.closePath()
+    ctx.fill()
+    // 円柱の陰影を焦げの上にも重ねる（平たく見えないように）
+    const shade = ctx.createLinearGradient(0, -thickness / 2, 0, thickness / 2)
+    shade.addColorStop(0, 'rgba(0, 0, 0, 0.3)')
+    shade.addColorStop(0.3, 'rgba(255, 235, 210, 0.16)')
+    shade.addColorStop(0.55, 'rgba(255, 255, 255, 0)')
+    shade.addColorStop(1, 'rgba(0, 0, 0, 0.4)')
+    ctx.fillStyle = shade
+    ctx.fillRect(cx - thickness * 0.4, -thickness / 2, xEnd - cx + thickness * 0.4, thickness)
+    if (layout.crust > 0) drawAshCrust(ctx, xEnd - length * layout.crust, length * layout.crust, thickness)
+    ctx.restore()
+  }
+  const band = Math.max(thickness * 0.45, 2)
+  if (layout.ember) {
+    // 燃えている先端：本体の火側の端の内側を赤〜オレンジに光らせる
+    const flash = look.flash
+    ctx.save()
+    ctx.globalCompositeOperation = 'source-atop'
+    const g = ctx.createLinearGradient(xEnd - band * 1.3, 0, xEnd, 0)
+    g.addColorStop(0, 'rgba(60, 30, 15, 0.9)')
+    g.addColorStop(0.45, flash > 0 ? '#ff7a2a' : '#c8401a')
+    g.addColorStop(1, flash > 0 ? '#ffd27a' : '#ff8a3d')
+    ctx.fillStyle = g
+    ctx.fillRect(xEnd - band * 1.3, -thickness / 2, band * 1.3, thickness)
+    ctx.restore()
+  }
+  // 灰の柱（本体の外側。灰の長さは本体の全長と独立）
+  const ashLen = layout.ashOutside * length
+  if (ashLen > 0.5) drawAshColumn(ctx, xEnd - band * 0.1, ashLen, thickness)
+  if (layout.ember) drawEmberGlow(ctx, xEnd, thickness, now, 1 + look.flash * 1.6)
+}
+
+/** STEP 11：シケモクの先端の灰の固まり（本体の内側。灰色のまだら） */
+function drawAshCrust(ctx: CanvasRenderingContext2D, x: number, len: number, thickness: number) {
+  const g = ctx.createLinearGradient(x, 0, x + len, 0)
+  g.addColorStop(0, 'rgba(70, 64, 58, 0)')
+  g.addColorStop(0.35, 'rgba(120, 114, 106, 0.85)')
+  g.addColorStop(1, 'rgba(165, 160, 152, 0.95)')
+  ctx.fillStyle = g
+  ctx.fillRect(x, -thickness / 2, len, thickness)
+  ctx.fillStyle = 'rgba(30, 26, 22, 0.55)'
+  for (let i = 0; i < 9; i++) {
+    const px = x + len * ((i * 0.43 + 0.2) % 1)
+    const py = -thickness / 2 + thickness * ((i * 0.67 + 0.1) % 1)
+    ctx.fillRect(px, py, Math.max(thickness * 0.1, 1), Math.max(thickness * 0.08, 1))
+  }
+}
+
+function mixColor(a: number[], b: number[], t: number): string {
+  const k = Math.min(Math.max(t, 0), 1)
+  const c = a.map((v, i) => Math.round(v + (b[i] - v) * k))
+  return `rgb(${c[0]}, ${c[1]}, ${c[2]})`
+}
+
+/**
+ * STEP 10：先端にたまった灰（回転済みの座標。x から +x 方向へ len）。白・灰色・黒の筋と、不規則な輪郭。
+ * 形は位置によらない決まった揺らぎ（毎フレーム同じ形）にして、ちらつかないようにする。
+ */
+function drawAshColumn(ctx: CanvasRenderingContext2D, x: number, len: number, thickness: number) {
+  const h = thickness * 0.94
+  const steps = 6
+  ctx.save()
+  ctx.beginPath()
+  ctx.moveTo(x, -h / 2)
+  for (let i = 1; i <= steps; i++) ctx.lineTo(x + (len * i) / steps, -h / 2 + h * 0.06 * Math.sin(i * 1.7 + 0.4))
+  // 先端は少し崩れた丸み
+  for (let i = 0; i <= steps; i++) {
+    const y = -h / 2 + (h * i) / steps
+    ctx.lineTo(x + len - h * (0.08 + 0.16 * Math.abs(Math.sin(i * 2.1 + 0.7))), y)
+  }
+  for (let i = steps - 1; i >= 0; i--) ctx.lineTo(x + (len * i) / steps, h / 2 - h * 0.06 * Math.sin(i * 1.3 + 1.9))
+  ctx.closePath()
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2)
+  g.addColorStop(0, '#d9d6d0')
+  g.addColorStop(0.45, '#a8a39c')
+  g.addColorStop(1, '#5e5a55')
+  ctx.fillStyle = g
+  ctx.fill()
+  ctx.clip()
+  // 燃えた巻紙の輪の跡（黒い筋）と白い粒
+  ctx.strokeStyle = 'rgba(40, 36, 32, 0.45)'
+  ctx.lineWidth = Math.max(h * 0.06, 0.8)
+  for (let sx = x + h * 0.35; sx < x + len; sx += h * 0.42) {
+    ctx.beginPath()
+    ctx.moveTo(sx, -h / 2)
+    ctx.lineTo(sx + h * 0.08, h / 2)
+    ctx.stroke()
+  }
+  ctx.fillStyle = 'rgba(250, 250, 246, 0.6)'
+  for (let i = 0; i < 5; i++) {
+    const px = x + len * ((i * 0.37 + 0.15) % 1)
+    const py = -h / 2 + h * ((i * 0.61 + 0.2) % 1)
+    ctx.fillRect(px, py, Math.max(h * 0.08, 1), Math.max(h * 0.08, 1))
+  }
+  ctx.restore()
+}
+
+/** 火の先端の発光（STEP 4：着火済みのときだけ。赤く脈打つように揺らぐ。STEP 10：boost で灰を落とした直後に強く光る） */
+function drawEmberGlow(ctx: CanvasRenderingContext2D, tipX: number, thickness: number, now: number, boost = 1) {
+  const flicker = Math.min(1, (0.7 + 0.3 * Math.sin(now / 90) * Math.sin(now / 37)) * boost)
   const pulse = 0.85 + 0.15 * Math.sin(now / 420)
-  const r = thickness * 1.2 * pulse
+  const r = thickness * 1.2 * pulse * (1 + (boost - 1) * 0.3)
   const glow = ctx.createRadialGradient(tipX, 0, 0, tipX, 0, r)
   glow.addColorStop(0, `rgba(255, 190, 90, ${0.75 * flicker})`)
   glow.addColorStop(0.35, `rgba(255, 70, 20, ${0.5 * flicker})`)

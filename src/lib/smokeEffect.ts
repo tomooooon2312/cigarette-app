@@ -55,8 +55,13 @@ export type SmokeSource = {
   position: Point2
   /** 粒子の大きさの基準 px（顔・タバコ・画面の大きさから決める） */
   scale: number
-  /** 噴き出す向き（単位ベクトル）。mouth のみ使う */
+  /** 噴き出す向き（単位ベクトル）。mouth のみ使う。STEP 10：横向きの成分の向き（正面向きでは frontal が大きくなる） */
   direction: Point2
+  /**
+   * STEP 10：正面向きの度合い 0〜1（mouth のみ。ember は 0）。1 は顔が正面で、口元からカメラの方へ左右対称に膨らむ煙、
+   * 0 は横向きで、STEP 3.2 からの横に噴き出す煙。その間は滑らかに補間する
+   */
+  frontal: number
 }
 
 export type SmokeSourceInput = {
@@ -69,6 +74,18 @@ export type SmokeSourceInput = {
 
 /** 顔の向きがこれより小さい（ほぼ正面）ときは、直前の向きに噴き出す */
 const FACING_DEADZONE = 0.12
+/**
+ * STEP 10：顔の向き |facing| が FRONTAL_FULL 以下なら完全に正面の煙、LATERAL_FULL 以上なら完全に横向きの煙（STEP 3.2 と同じ）。
+ * その間は smoothstep で補間する（斜め向き）。
+ */
+export const FRONTAL_FULL = 0.08
+export const LATERAL_FULL = 0.38
+
+/** STEP 10：顔の向きから、正面の煙の度合い（1 = 正面、0 = 横向き）を求める。連続で、|facing| に対して単調に減る */
+export function frontalAmount(facing: number): number {
+  const t = Math.min(Math.max((Math.abs(facing) - FRONTAL_FULL) / (LATERAL_FULL - FRONTAL_FULL), 0), 1)
+  return 1 - t * t * (3 - 2 * t)
+}
 /** 噴き出す向きの下向き成分（ラジアン）。吐いた煙は少し下へ出てから浮き上がる */
 const EXHALE_DOWNWARD = 0.12
 
@@ -76,6 +93,7 @@ const EXHALE_DOWNWARD = 0.12
  * 状態機械が選んだ発生源を、画面上の位置・向き・大きさに変換する（発生位置の決定はここに一元化する）。
  * ember はタバコ CG の火側の端、mouth は唇の中心。
  * 口元の煙は顔が向いている側（表示座標＝ミラー後で判定するので左右反転にも追従）へ横向きに噴き出す。
+ * STEP 10：顔が正面に近いほど frontal が大きくなり、口元の中央からカメラの方へ左右対称に膨らむ煙にする（斜めは補間）。
  */
 export function resolveSmokeSource(
   emitter: SmokeEmitter,
@@ -90,6 +108,7 @@ export function resolveSmokeSource(
       position: input.emberEnd,
       scale: clampScale(Math.max(input.cigaretteThickness, 6)),
       direction: { x: 0, y: -1 },
+      frontal: 0,
     }
   }
   if (emitter === 'mouth' && input.mouth) {
@@ -100,6 +119,7 @@ export function resolveSmokeSource(
       position: input.mouth.center,
       scale: clampScale(input.mouth.width * 0.45),
       direction: { x: side * Math.cos(EXHALE_DOWNWARD), y: Math.sin(EXHALE_DOWNWARD) },
+      frontal: frontalAmount(facing),
     }
   }
   return null
@@ -122,6 +142,8 @@ type Particle = {
   wobbleRamp: number
   /** 広がり方：'fast' は生まれてすぐ広がる、'delayed' は細い流れのまま進んでから大きく広がる（STEP 4） */
   growthCurve: 'fast' | 'delayed'
+  /** STEP 10：正面向きの煙の度合い（広がり方を、カメラの方へ膨らむ速い広がりに寄せる） */
+  frontal: number
   radius: number
   /** 最終的な半径の増分 px（発生直後に速く、その後ゆっくり広がる） */
   growth: number
@@ -174,7 +196,7 @@ export class SmokeEffect {
       p.y += p.vy * dt
       p.rotation += p.spin * dt
       // 小さく生まれて広がる（突然大きな円にならない）。delayed は最初ほとんど広がらず、減速してから大きな塊になる
-      p.radius = p.r0 + p.growth * growthFactor(p.growthCurve, p.age)
+      p.radius = p.r0 + p.growth * growthFactor(p.growthCurve, p.age, p.frontal)
     }
     if (this.particles.some((p) => p.age >= p.life)) {
       this.particles = this.particles.filter((p) => p.age < p.life)
@@ -246,34 +268,46 @@ export class SmokeEffect {
 const rand = (min: number, max: number) => min + Math.random() * (max - min)
 
 /** 半径の増え方（0 → 1）。fast：1 − e^(−1.4t)、delayed：1 − e^(−kt)(1 + kt)（ガンマ分布の累積、立ち上がりが遅い） */
-function growthFactor(curve: Particle['growthCurve'], age: number): number {
+function growthFactor(curve: Particle['growthCurve'], age: number, frontal = 0): number {
   if (curve === 'fast') return 1 - Math.exp(-age * 1.4)
   const k = age * 1.6
-  return 1 - Math.exp(-k) * (1 + k)
+  const delayed = 1 - Math.exp(-k) * (1 + k)
+  if (frontal <= 0) return delayed
+  // STEP 10：正面の煙は、口元で小さく密集した状態からすぐに膨らみ始める（カメラの方へ近づいてくる見え方）
+  const toward = 1 - Math.exp(-age * 2.2)
+  return delayed + (toward - delayed) * frontal
 }
 
-function mouthParticle({ position, scale: s, direction }: SmokeSource, style: SmokeStyle): Particle {
+function mouthParticle({ position, scale: s, direction, frontal }: SmokeSource, style: SmokeStyle): Particle {
   // 噴き出す向きを中心に、細い円錐状に散らす（STEP 4：0.22 → 0.1。最初は細い流れにする）
   const cone = 0.1 * style.spread
   const a = Math.atan2(direction.y, direction.x) + rand(-cone, cone)
   // STEP 4：初速を STEP 3.2 の 7〜11 から 10〜14 に強化（STEP 3.1 の約 4 倍）
   const speed = s * rand(10, 14) * style.speed
+  const f = Math.min(Math.max(frontal, 0), 1)
+  // STEP 10：正面の煙は、左右対称にゆっくり広がり（横の初速は横向きの煙の約 1/4）、少し下へ出てから浮き上がる
+  const sideSpeed = s * 3 * Math.sqrt(style.speed) * Math.sqrt(style.spread)
+  const fvx = rand(-1, 1) * sideSpeed
+  const fvy = s * rand(-0.4, 1.2) * Math.sqrt(style.speed)
+  const lerp = (lateral: number, front: number) => lateral + (front - lateral) * f
   return {
     kind: 'mouth',
     // 発生直後は密集させる（口元付近の小さな範囲から出す）
     x: position.x + rand(-0.06, 0.06) * s,
     y: position.y + rand(-0.05, 0.05) * s,
-    vx: Math.cos(a) * speed,
-    vy: Math.sin(a) * speed,
-    drag: rand(1.8, 2.4),
+    vx: lerp(Math.cos(a) * speed, fvx),
+    vy: lerp(Math.sin(a) * speed, fvy),
+    drag: lerp(rand(1.8, 2.4), rand(2.2, 2.8)),
     lift: s * rand(1.4, 2.0),
-    wobble: s * 1.4 * style.spread,
+    wobble: s * 1.4 * style.spread * lerp(1, 0.6),
     phase: rand(0, Math.PI * 2),
     wobbleRamp: 0.5,
     growthCurve: 'delayed',
+    frontal: f,
     r0: s * rand(0.05, 0.09),
     radius: s * 0.05,
-    growth: s * rand(2.4, 3.4) * style.spread,
+    // 正面の煙はカメラの方へ近づくように大きく膨らむ
+    growth: s * rand(2.4, 3.4) * style.spread * lerp(1, 1.5),
     age: 0,
     life: rand(2.0, 3.2),
     maxAlpha: rand(0.38, 0.52),
@@ -299,6 +333,7 @@ function emberParticle({ position, scale: s }: SmokeSource, style: SmokeStyle): 
     phase: rand(0, Math.PI * 2),
     wobbleRamp: 0.01,
     growthCurve: 'fast',
+    frontal: 0,
     r0: s * rand(0.1, 0.16),
     radius: s * 0.1,
     growth: s * rand(0.6, 0.9) * spread,

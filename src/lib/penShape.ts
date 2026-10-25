@@ -127,8 +127,12 @@ export function scorePenShape(
   pen: PenDetection,
   mask: ArrayLike<number>,
   hands: ShapeHand[] | null,
+  /** 遠距離認識の ROI：面積・太さの比率を測る画面の大きさ（省略時はマスクと同じ pen.frameWidth / frameHeight） */
+  ratioFrame?: { width: number; height: number },
 ): ShapeScore {
   const { frameWidth: W, frameHeight: H } = pen
+  const RW = ratioFrame?.width ?? W
+  const RH = ratioFrame?.height ?? H
   const T = SHAPE_THRESHOLDS
   const aspect = ramp(pen.length / Math.max(pen.thickness, 1), T.aspect[0], T.aspect[1])
   // 各輪郭の面積が、その輪郭の回転矩形の面積をどれだけ埋めているか（面積加重）
@@ -142,8 +146,8 @@ export function scorePenShape(
   const straightness = ramp(fill, T.straightness[0], T.straightness[1])
   const cv = widthVariation(widthProfile(mask, W, H, pen))
   const uniformity = cv === null ? 0.5 : 1 - ramp(cv, T.uniformity[0], T.uniformity[1])
-  const area = 1 - ramp(pen.area / Math.max(W * H, 1), T.areaRatio[0], T.areaRatio[1])
-  const size = 1 - ramp(pen.thickness / Math.max(Math.min(W, H), 1), T.thicknessRatio[0], T.thicknessRatio[1])
+  const area = 1 - ramp(pen.area / Math.max(RW * RH, 1), T.areaRatio[0], T.areaRatio[1])
+  const size = 1 - ramp(pen.thickness / Math.max(Math.min(RW, RH), 1), T.thicknessRatio[0], T.thicknessRatio[1])
 
   let hand: number | null = null
   if (hands && hands.length > 0) {

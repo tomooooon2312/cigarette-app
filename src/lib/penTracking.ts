@@ -7,6 +7,11 @@ export type TrackingSettings = {
   holdMs: number
   /** ペンの片側が完全に隠れて短くなったとき、直前の全長で補完する */
   lengthCompletion: boolean
+  /**
+   * 遠距離認識モード：見失っている間（held）、直前の動きから位置を予測する（最大 PREDICT_MAX_MS 分）。
+   * 予測した位置は status = 'held'・predicted = true で、実際に検出した位置（measured）と区別する
+   */
+  predictHeld?: boolean
 }
 
 export const DEFAULT_TRACKING: TrackingSettings = {
@@ -22,7 +27,14 @@ export type TrackedPen = PenDetection & {
   lengthCompleted: boolean
   /** 最後に計測できてからの経過時間 ms（measured なら 0） */
   sinceMeasuredMs: number
+  /** 遠距離認識モード：位置を直前の動きから予測した（実際の検出ではない） */
+  predicted?: boolean
 }
+
+/** 遠距離認識モードで、見失っている間に直前の動きで位置を進める時間の上限 ms（これ以降は止まる） */
+export const PREDICT_MAX_MS = 250
+/** 遠距離認識モードの、見失ってから CG を保持する時間 ms（STEP 1.1 からの既定は 300ms） */
+export const FAR_HOLD_MS = 600
 
 /** 前回結果と連続しているとみなす最大の時間間隔 ms（保持時間が短くても平滑化は効かせる） */
 const MIN_CONTINUITY_MS = 200
@@ -48,6 +60,8 @@ type State = {
   referenceAt: number
   last: PenDetection
   lengthCompleted: boolean
+  /** 中心の移動速度 px/ms（予測用） */
+  velocity: Point2
 }
 
 const dot = (a: Point2, b: Point2) => a.x * b.x + a.y * b.y
@@ -69,7 +83,7 @@ export class PenTrackingFilter {
       prev !== null && now - prev.lastSeenAt <= Math.max(settings.holdMs, MIN_CONTINUITY_MS)
 
     if (!measured) {
-      if (prev && now - prev.lastSeenAt <= settings.holdMs) return this.output('held', now)
+      if (prev && now - prev.lastSeenAt <= settings.holdMs) return this.output('held', now, settings.predictHeld === true)
       this.state = null
       return null
     }
@@ -113,6 +127,7 @@ export class PenTrackingFilter {
         const norm = Math.hypot(ux, uy) || 1
         u = { x: ux / norm, y: uy / norm }
         length = lerp(prev.length, length, a)
+        const dt = Math.max(now - prev.lastSeenAt, 1)
         this.state = {
           center,
           u,
@@ -123,6 +138,10 @@ export class PenTrackingFilter {
           referenceAt,
           last: measured,
           lengthCompleted,
+          velocity: {
+            x: lerp(prev.velocity.x, (center.x - prev.center.x) / dt, 0.5),
+            y: lerp(prev.velocity.y, (center.y - prev.center.y) / dt, 0.5),
+          },
         }
         return this.output('measured', now)
       }
@@ -138,15 +157,18 @@ export class PenTrackingFilter {
       referenceAt,
       last: measured,
       lengthCompleted,
+      velocity: { x: 0, y: 0 },
     }
     return this.output('measured', now)
   }
 
-  private output(status: TrackedPen['status'], now: number): TrackedPen {
+  private output(status: TrackedPen['status'], now: number, predict = false): TrackedPen {
     const s = this.state!
+    // 遠距離認識モード：見失っている間は直前の動きで少しだけ位置を進める（最大 PREDICT_MAX_MS 分）
+    const ahead = predict && status === 'held' ? Math.min(now - s.lastSeenAt, PREDICT_MAX_MS) : 0
     const pen = penFromAxis(
       {
-        center: s.center,
+        center: ahead > 0 ? { x: s.center.x + s.velocity.x * ahead, y: s.center.y + s.velocity.y * ahead } : s.center,
         u: s.u,
         length: s.length,
         thickness: s.thickness,
@@ -157,7 +179,7 @@ export class PenTrackingFilter {
       },
       false,
     )
-    return { ...pen, status, lengthCompleted: s.lengthCompleted, sinceMeasuredMs: now - s.lastSeenAt }
+    return { ...pen, status, lengthCompleted: s.lengthCompleted, sinceMeasuredMs: now - s.lastSeenAt, predicted: ahead > 0 }
   }
 }
 

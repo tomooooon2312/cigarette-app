@@ -8,9 +8,10 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "node --import ./tests/resolve-ts.mjs --test tests/*.test.ts",
+    "test": "node --import ./tests/resolve-ts.mjs --test --test-timeout=30000 tests/*.test.ts",
     "ios:sync": "npm run build && cap sync ios",
-    "ios:open": "cap open ios"
+    "ios:open": "cap open ios",
+    "poster-server": "node server/posterServer.ts"
   },
   "dependencies": {
     "@capacitor/core": "8.5.3",

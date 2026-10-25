@@ -1,6 +1,7 @@
 import type { FaceLandmarker, NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { loadVision, modelUrl } from './mediapipeVision'
 import type { Point2 } from './penGeometry'
+import { posterFaceFromLandmarks, type PosterFace } from './posterRenderer'
 
 /** 公式配布の Face Landmarker モデル（float16 / v1）を public/models に同梱している */
 const MODEL_URL = modelUrl('face_landmarker.task')
@@ -47,6 +48,8 @@ export type Mouth = {
   detectedAt: number
   /** デバッグ表示用のランドマーク（表示座標） */
   debugPoints: Point2[]
+  /** STEP 14：ポスターの顔のパーツ（猫耳・メイク・前髪）の配置に使うランドマーク（表示座標） */
+  poster: PosterFace
 }
 
 /**
@@ -159,6 +162,7 @@ function toMouth(
     faceScale,
     facing: Math.max(-1, Math.min(1, (at(NOSE_TIP).x - eyeMidX) / (faceScale / 2))),
     debugPoints: DEBUG_LANDMARKS.map(at),
+    poster: posterFaceFromLandmarks(at),
     ...extra,
   }
 }

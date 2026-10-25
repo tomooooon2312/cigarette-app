@@ -6,14 +6,22 @@ import {
   DEFAULT_CIGARETTE,
   type CgChoice,
   type CgKind,
+  type CigaretteLook,
   type CigarettePlacement,
   type CigaretteSettings,
 } from '../lib/cigaretteRenderer'
-import { DEFAULT_FIRE, FireController, type FireFrame, type FireSettings } from '../lib/fireController'
-import type { ActiveFlame } from '../lib/flameEffect'
+import { DEFAULT_FIRE, FireController, type FireFrame, type FireSettings, type HandFireView } from '../lib/fireController'
+import { FLAME_DURATION_MS, PREVIOUS_FLAME_DURATION_MS, type ActiveFlame } from '../lib/flameEffect'
+import type { TapDebug } from '../lib/ashTap'
+import { BURN_LIFETIME_MS, type CigaretteState } from '../lib/cigaretteLife'
+import { DEFAULT_FAR, FAR_CRITERIA, MAX_ROIS, ROI_IMAGE_SIZE, CandidateMemory, buildRois, mergeDetections, roiSourceRect, type FarSettings, type Roi } from '../lib/farDetection'
+import { FAR_HOLD_MS } from '../lib/penTracking'
 import { HAND_CONNECTIONS, HandTracker, type TrackedHand } from '../lib/handTracker'
 import type { IgnitionOutput } from '../lib/ignition'
+import type { HoldState } from '../lib/handHold'
+import { WAVE_MIN_REVERSALS, WAVE_MIN_SPEED, type WaveDebug } from '../lib/waveDetector'
 import { LighterDetector } from '../lib/lighterDetector'
+import type { SmallCandidate } from '../lib/penDetector'
 import { drawLighter } from '../lib/lighterRenderer'
 import { MouthTracker, type Mouth } from '../lib/mouthTracker'
 import type { IdentifiedPen } from '../lib/multiPenTracker'
@@ -31,6 +39,13 @@ import {
   type PenColor,
 } from '../lib/penColors'
 import { DEFAULT_SHAPE, type ShapeSettings } from '../lib/penShape'
+import { CameraSwitcher, FACING_LABELS, cameraConstraints, defaultMirror, type CameraFacing } from '../lib/cameraSwitcher'
+import { FILTERS, FILTER_IDS, cssFilter, vignetteCss, type FilterId } from '../lib/photoFilters'
+import { canvasToJpeg, composePhoto, drawVideoFrame, photoFileName } from '../lib/photoCapture'
+import { savePhoto } from '../lib/photoSaver'
+import { scaleFace, type PosterFace } from '../lib/posterRenderer'
+import { PosterEditor } from './PosterEditor'
+import type { SnapAttempt, SnapDebug } from '../lib/snapDetector'
 import {
   PersonController,
   SOLO_PERSON_ID,
@@ -81,8 +96,29 @@ type Stats = {
   flames: ActiveFlame['source'][]
   lighterFound: boolean
   hands: number
-  /** 親指と中指の距離（手の大きさで正規化、最初の手） */
+  /** 親指と人差し指の距離（手の大きさで正規化、最初の手。STEP 9 までは親指と中指） */
   snapDistance: number | null
+  /** 着火ジェスチャーのデバッグ（手ごとの段階・距離・接触時間など、灰落としのタップの状態、直近の評価の結果、成功の回数） */
+  snapHands: (SnapDebug & { key: string; side: string; tap: TapDebug | null; hold: HandFireView | null; wave: WaveDebug | null })[]
+  /** STEP 11：代表の人物のタバコ CG の全長 px（着火距離の px 表示） */
+  cigaretteLength: number | null
+  snapAttempts: SnapAttempt[]
+  snapSuccesses: number
+  /** STEP 10：炎の残り時間 */
+  flameRemaining: { handKey: string | null; remainingMs: number; durationMs: number }[]
+  /** STEP 10：タバコごとの燃焼の状態 */
+  lives: { key: string; state: CigaretteState; burnMs: number; ash: number; exitCandidate: boolean; exited: boolean }[]
+  /** STEP 10：人物ごとの、煙の向きに使った顔の向き・正面の度合い・横の向き */
+  exhale: { personId: number; facing: number | null; frontal: number | null; side: number | null }[]
+  ashParticles: number
+  /** 遠距離認識：カメラの実際の解像度（MediaStreamTrack.getSettings）、ペン検出の時間 ms（全画面・ROI）、ROI の数、ROI で見つけた本数、予測中の本数 */
+  cameraWidth: number
+  cameraHeight: number
+  detectMs: number
+  roiMs: number
+  rois: number
+  roiPens: number
+  predictedPens: number
   /** STEP 5：複数人 */
   persons: PersonStat[]
   /** 口元が有効な顔の数・追跡中のペンの数 */
@@ -130,6 +166,21 @@ const EMPTY_STATS: Stats = {
   lighterFound: false,
   hands: 0,
   snapDistance: null,
+  snapHands: [],
+  cigaretteLength: null,
+  snapAttempts: [],
+  snapSuccesses: 0,
+  flameRemaining: [],
+  lives: [],
+  exhale: [],
+  ashParticles: 0,
+  cameraWidth: 0,
+  cameraHeight: 0,
+  detectMs: 0,
+  roiMs: 0,
+  rois: 0,
+  roiPens: 0,
+  predictedPens: 0,
   persons: [],
   facesVisible: 0,
   pensTracked: 0,
@@ -137,6 +188,29 @@ const EMPTY_STATS: Stats = {
   handHz: 0,
   particles: 0,
   penList: [],
+}
+
+/** STEP 9：撮影した写真（プレビュー中は blob と表示用の URL を持ち、保存・撮り直しで解放する） */
+type Photo = {
+  blob: Blob | null
+  url: string | null
+  thumb: string
+  saved: boolean
+  /** STEP 14：撮影時の顔（写真の座標）。ポスターの顔のパーツに使う */
+  faces: PosterFace[]
+}
+type Toast = { kind: 'ok' | 'error' | 'info'; text: string }
+
+/** 撮影した写真の小さな見本（下部の導線用）を作る。元の写真の blob は保持しない */
+function makeThumb(source: HTMLCanvasElement): string {
+  const t = document.createElement('canvas')
+  const s = 96 / Math.max(source.width, source.height)
+  t.width = Math.round(source.width * s)
+  t.height = Math.round(source.height * s)
+  t.getContext('2d')?.drawImage(source, 0, 0, t.width, t.height)
+  const url = t.toDataURL('image/jpeg', 0.7)
+  t.width = 0
+  return url
 }
 
 /** 「画面をタップして色を登録」で推定した色（登録前に名前と範囲を編集する） */
@@ -151,6 +225,10 @@ export function PenTracker() {
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  /** STEP 9：AR（タバコ CG・炎・煙・認識枠）を描く canvas。映像の canvas の上に重ね、フィルターをかけない */
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
+  /** STEP 9：カメラの切り替え（連打しても二重に開かない） */
+  const switcherRef = useRef<CameraSwitcher | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const rafRef = useRef<number | null>(null)
   const detectorRef = useRef<PenDetector | null>(null)
@@ -198,6 +276,33 @@ export function PenTracker() {
   const [personMode, setPersonMode] = useState<PersonMode>(1)
   const [autoPerf, setAutoPerf] = useState(true)
   const [stats, setStats] = useState<Stats>(EMPTY_STATS)
+  // STEP 9：カメラの向き・切り替え中、フィルター、写真
+  const [facing, setFacing] = useState<CameraFacing>('user')
+  const [switching, setSwitching] = useState(false)
+  const [filter, setFilter] = useState<FilterId>('normal')
+  const [photo, setPhoto] = useState<Photo | null>(null)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  /** STEP 14：映画ポスターの編集画面を開いているか */
+  const [posterOpen, setPosterOpen] = useState(false)
+  /** STEP 14：最後に検出した顔（表示座標）と時刻 */
+  const posterFacesRef = useRef<{ faces: PosterFace[]; at: number }>({ faces: [], at: -Infinity })
+  const [capturing, setCapturing] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [toast, setToast] = useState<Toast | null>(null)
+  /** 詳細設定（従来の設定欄）を開いているか。iPhone の縦画面では最初は閉じる */
+  const [settingsOpen, setSettingsOpen] = useState(() => typeof window === 'undefined' || window.matchMedia('(min-width: 861px)').matches)
+  /** STEP 10：開発者向けの表示（デバッグ・調整）。通常のデモでは隠す */
+  const [devMode, setDevMode] = useState(false)
+  /** 遠距離認識モード（初期値 OFF） */
+  const [far, setFar] = useState<FarSettings>(DEFAULT_FAR)
+  /** 遠距離認識：ROI の画像を切り出す canvas（ROI_IMAGE_SIZE 四方。使い回す） */
+  const roiCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  /** 遠距離認識：直前のフレームの顔（ROI を作るのに使う。顔の推論はペン検出の後なので 1 フレーム前の値） */
+  const lastFacesRef = useRef<{ center: { x: number; y: number }; faceScale: number }[]>([])
+  /** 遠距離認識：色の候補の ROI の空振りの記憶 */
+  const candidateMemoryRef = useRef(new CandidateMemory())
+  /** 遠距離認識：直前のフレームで見失っていた（held）ペンの位置 */
+  const lastHeldRef = useRef<{ center: { x: number; y: number }; length: number }[]>([])
 
   // 描画ループからは ref 経由で最新値を読む（ループを張り直さないため）
   const settingsRef = useRef(settings)
@@ -208,6 +313,7 @@ export function PenTracker() {
   const smokeSettingsRef = useRef(smoke)
   const fireSettingsRef = useRef(fire)
   const mirrorRef = useRef(mirror)
+  const facingRef = useRef(facing)
   const personModeRef = useRef(personMode)
   const autoPerfRef = useRef(autoPerf)
   const colorSettingsRef = useRef(colorSettings)
@@ -229,6 +335,14 @@ export function PenTracker() {
     shapeRef.current = shape
     dirtyRef.current = true
   }, [settings, tracking, viewMode, overlay, cigarette, smoke, fire, personMode, autoPerf, colorSettings, shape])
+  // 遠距離認識モード・開発者向けの表示（描画ループからは ref で読む）
+  const farRef = useRef(far)
+  const devModeRef = useRef(devMode)
+  useEffect(() => {
+    farRef.current = far
+    devModeRef.current = devMode
+    dirtyRef.current = true
+  }, [far, devMode])
   // 色の設定（カスタム色・各色の範囲・認識モード）はブラウザに保存する
   useEffect(() => saveColorSettings(colorSettings), [colorSettings])
 
@@ -268,6 +382,8 @@ export function PenTracker() {
     }
     const canvas = canvasRef.current
     canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+    const overlayCanvas = overlayCanvasRef.current
+    overlayCanvas?.getContext('2d')?.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height)
 
     detectorRef.current?.dispose()
     detectorRef.current = null
@@ -279,6 +395,35 @@ export function PenTracker() {
     resetPeople()
     setCameraStatus('idle')
     setStats(EMPTY_STATS)
+  }, [resetPeople])
+
+  /**
+   * カメラの映像のトラックが終わったら（ケーブルが抜けた・他のアプリが使った等）カメラを止める。
+   * STEP 9：切り替えで止めた古いカメラの終了は無視する（今の映像のトラックのときだけ反応する）
+   */
+  const watchTrackEnd = useCallback(
+    (stream: MediaStream) => {
+      const session = sessionRef.current
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        if (session !== sessionRef.current || streamRef.current !== stream) return
+        stopCamera()
+        setError('カメラが切断されました')
+      })
+    },
+    [stopCamera],
+  )
+
+  /** STEP 9：座標系が変わる操作（左右反転・カメラの切り替え）の後に、追跡・煙・炎・AR の表示を初期化する */
+  const resetTrackingAll = useCallback(() => {
+    candidateMemoryRef.current.reset()
+    lastHeldRef.current = []
+    lastFacesRef.current = []
+    resetPeople()
+    handTrackerRef.current?.reset()
+    fireRef.current.resetTracking()
+    const overlayCanvas = overlayCanvasRef.current
+    overlayCanvas?.getContext('2d')?.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height)
+    dirtyRef.current = true
   }, [resetPeople])
 
   const startCamera = useCallback(async () => {
@@ -294,25 +439,15 @@ export function PenTracker() {
           'このブラウザはカメラAPIに対応していません（HTTPS または localhost で開いてください）',
         )
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-        audio: false,
-      })
+      // STEP 9：選んでいるカメラ（初期はインカメラ）を開く
+      const stream = await navigator.mediaDevices.getUserMedia(cameraConstraints(facingRef.current))
       if (!isCurrent()) {
         // 待機中に停止・アンマウントされた
         stream.getTracks().forEach((track) => track.stop())
         return
       }
       streamRef.current = stream
-      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
-        if (!isCurrent()) return
-        stopCamera()
-        setError('カメラが切断されました')
-      })
+      watchTrackEnd(stream)
 
       const video = videoRef.current
       if (!video) throw new Error('video 要素が見つかりません')
@@ -339,6 +474,9 @@ export function PenTracker() {
     // 推論頻度の実測（処理負荷の表示用）
     let faceSamples = 0
     let handSamples = 0
+    // 遠距離認識：ペン検出の時間 ms（全画面・ROI。指数移動平均）
+    let detectMs = 0
+    let roiMs = 0
     let faceHz = 0
     let handHz = 0
 
@@ -371,14 +509,19 @@ export function PenTracker() {
       const ctx = canvas.getContext('2d', { willReadFrequently: true })
       if (!ctx) return
 
-      // ミラーした映像そのものを解析するので、検出座標はそのまま表示座標として使える
-      ctx.save()
-      if (mirrorRef.current) {
-        ctx.translate(width, 0)
-        ctx.scale(-1, 1)
+      // ミラーした映像そのものを解析するので、検出座標はそのまま表示座標として使える。
+      // STEP 9：写真の合成（photoCapture.ts）と同じ変換で描く。CSS のフィルターは表示だけにかかり、この画素（OpenCV の入力）は元映像のまま
+      drawVideoFrame(ctx, video, width, height, mirrorRef.current)
+      // STEP 9：AR は映像と同じ大きさの別の canvas（透明）に描く
+      const overlayCanvas = overlayCanvasRef.current
+      if (!overlayCanvas) return
+      if (overlayCanvas.width !== width || overlayCanvas.height !== height) {
+        overlayCanvas.width = width
+        overlayCanvas.height = height
       }
-      ctx.drawImage(video, 0, 0, width, height)
-      ctx.restore()
+      const actx = overlayCanvas.getContext('2d')
+      if (!actx) return
+      actx.clearRect(0, 0, width, height)
 
       // 手の推論はペン検出より先に行う（STEP 6：手の近くの細長い物体をペンとして優先するため）
       let hands: TrackedHand[] = []
@@ -403,10 +546,62 @@ export function PenTracker() {
       const frameImage = ctx.getImageData(0, 0, width, height)
       lastFrameRef.current = frameImage
       const colors = activeColors(colorSettingsRef.current)
-      const colored = detector.detectColors(frameImage, settingsRef.current, colors, mode, {
+      const detectStart = performance.now()
+      const farOn = farRef.current.enabled && viewModeRef.current === 'camera'
+      const smallCandidates: SmallCandidate[] = []
+      const fullDetections = detector.detectColors(frameImage, settingsRef.current, colors, mode, {
         shape: shapeRef.current,
         hands: hands.map((h) => ({ points: h.landmarks, scale: h.sample.scale })),
+        smallCandidates: farOn ? smallCandidates : undefined,
       })
+      const detectEnd = performance.now()
+      // 遠距離認識モード：小さく写った顔・手の近くだけ、カメラの映像から高解像度で切り出して小さいペンを探す
+      let colored = fullDetections
+      let rois: Roi[] = []
+      let roiPens = 0
+      // 全画面の検出で人数分のペンが見つかったときは ROI を調べない（近距離では追加の処理をしない）
+      if (farOn && fullDetections.length < mode) {
+        rois = buildRois(
+          {
+            faces: lastFacesRef.current,
+            hands: hands.map((h) => ({ landmarks: h.landmarks, scale: h.sample.scale })),
+            // 見失った直後のペン（予測で表示中）の位置。顔・手が小さすぎて MediaPipe で見つからないときの補助
+            tracked: lastHeldRef.current,
+            candidates: candidateMemoryRef.current.filter(smallCandidates, now),
+            found: fullDetections.map((d) => d.pen),
+          },
+          width,
+          height,
+          MAX_ROIS[mode],
+        )
+        if (rois.length > 0) {
+          const roiCanvas = (roiCanvasRef.current ??= Object.assign(document.createElement('canvas'), { width: ROI_IMAGE_SIZE, height: ROI_IMAGE_SIZE }))
+          const rctx = roiCanvas.getContext('2d', { willReadFrequently: true })
+          if (rctx) {
+            const found = []
+            for (const roi of rois) {
+              const before = found.length
+              // 処理解像度の座標（ミラー後）→ カメラの映像の座標。ミラーなら左右を反転して切り出す（表示・CG と同じ向き）
+              const src = roiSourceRect(roi, width, scale, mirrorRef.current)
+              rctx.setTransform(src.flip ? -1 : 1, 0, 0, 1, src.flip ? ROI_IMAGE_SIZE : 0, 0)
+              rctx.drawImage(video, src.sx, src.sy, src.sw, src.sh, 0, 0, ROI_IMAGE_SIZE, ROI_IMAGE_SIZE)
+              const roiImage = rctx.getImageData(0, 0, ROI_IMAGE_SIZE, ROI_IMAGE_SIZE)
+              found.push(
+                ...detector.detectInRoi(roiImage, roi, width, height, settingsRef.current, colors, mode, {
+                  shape: shapeRef.current,
+                  hands: hands.map((h) => ({ points: h.landmarks, scale: h.sample.scale })),
+                }),
+              )
+              if (roi.kind === 'candidate' && found.length === before) candidateMemoryRef.current.miss(roi, now)
+            }
+            colored = mergeDetections(fullDetections, found, mode)
+            roiPens = colored.length - fullDetections.length
+          }
+        }
+      }
+      const roiEnd = performance.now()
+      detectMs = detectMs * 0.9 + (detectEnd - detectStart) * 0.1
+      roiMs = roiMs * 0.9 + (roiEnd - detectEnd) * 0.1
       const measuredPens = colored.map((c) => c.pen)
       const penInfo = colored.map((c) => ({ colorId: c.colorId, score: c.score?.total ?? null }))
       // ライター：ペン検出で作った HSV 画像を共有し、ペンの画素（全色のマスク）を除外して長方形を探す
@@ -430,7 +625,11 @@ export function PenTracker() {
           const result = mouthTracker.update(video, now, width, height, mirrorRef.current, perf.faceIntervalMs)
           mouths = result.mouths
           mouthsFresh = result.fresh
-          if (result.fresh) faceSamples++
+          if (result.fresh) {
+            faceSamples++
+            // STEP 14：撮影したときの顔（ポスターの顔のパーツの配置に使う。表示座標）
+            posterFacesRef.current = { faces: result.mouths.map((m) => m.poster), at: now }
+          }
         } catch (e) {
           // 顔検出の失敗でペン検出・CG 合成まで止めない
           mouthTracker.close()
@@ -449,11 +648,16 @@ export function PenTracker() {
         mouths,
         mouthsFresh,
         hands,
-        tracking: trackingRef.current,
+        // 遠距離認識モード：見失ったときの保持を長くし、保持中は直前の動きから位置を予測する（予測は検出と区別する）
+        tracking: farRef.current.enabled
+          ? { ...trackingRef.current, holdMs: Math.max(trackingRef.current.holdMs, FAR_HOLD_MS), predictHeld: true }
+          : trackingRef.current,
         cigarette: cigaretteSettings,
         showCigarette: overlayMode !== 'frame',
       })
       for (const id of frame.removedPersonIds) fireRef.current.forget(String(id))
+      lastFacesRef.current = frame.persons.flatMap((p) => (p.face ? [{ center: p.face.center, faceScale: p.face.faceScale }] : []))
+      lastHeldRef.current = frame.pens.filter((p) => p.status === 'held').map((p) => ({ center: p.center, length: p.length }))
 
       // 炎と着火：指パッチン・ライター・手動の炎と、人物ごとのタバコの火側の端の距離から UNLIT / LIT を決める
       const manualFlameRequested = manualFlameRef.current
@@ -474,33 +678,66 @@ export function PenTracker() {
             emberEnd: p.placement!.emberEnd,
             mouthEnd: p.placement!.mouthEnd,
             length: p.placement!.length,
+            thickness: p.placement!.thickness,
+            ends: p.pen!.endpoints,
+            measured: p.pen!.status === 'measured',
+            hasAsh: p.placement!.kind !== 'pipe',
           })),
         settings: fireSettings,
+        // STEP 10：複数人では、手の持ち主のタバコだけ灰を落とせる
+        handOwners:
+          mode === 1
+            ? undefined
+            : new Map([...frame.handOwners].map(([k, owner]) => [k, owner === null ? null : String(owner)])),
+        // STEP 12：手が持っているかを調べるペン。人物のペンは CG の吸い口 → 火側の端、対応付けていないペンは両端（火側は不明）
+        holdPens: [
+          ...frame.persons.flatMap((p) =>
+            p.pen && p.placement
+              ? [{ key: `P${p.pen.id}`, owner: String(p.id), a: p.placement.mouthEnd, b: p.placement.emberEnd, emberKnown: true, measured: p.pen.status === 'measured' }]
+              : [],
+          ),
+          ...frame.unassigned.map((u) => ({
+            key: `P${u.pen.id}`,
+            owner: null,
+            a: u.pen.endpoints[0],
+            b: u.pen.endpoints[1],
+            emberKnown: false,
+            measured: u.pen.status === 'measured',
+          })),
+        ],
       })
       const isLit = (personId: number) => fireFrame.ignitions.get(String(personId))?.state === 'LIT'
 
-      // 重ね順：元映像 → タバコ CG → ライター CG → 炎 → 煙 → 認識枠・デバッグ表示
+      // 重ね順：元映像（映像の canvas、フィルター）→ AR の canvas：タバコ CG → ライター CG → 炎 → 煙 → 認識枠・デバッグ表示
       const renderers = cigaretteRenderersRef.current
       const rendererKey = (pen: IdentifiedPen) => (mode === 1 ? 0 : pen.id)
       if (mode !== 1) {
         const keys = new Set(frame.pens.map(rendererKey))
         for (const key of [...renderers.keys()]) if (!keys.has(key)) renderers.delete(key)
       }
-      const drawCigarette = (pen: IdentifiedPen, emberDir: PersonView['emberDir'], lit: boolean, kind: CgKind) => {
+      const drawCigarette = (pen: IdentifiedPen, emberDir: PersonView['emberDir'], lit: boolean, kind: CgKind, look?: CigaretteLook) => {
         let renderer = renderers.get(rendererKey(pen))
         if (!renderer) {
           renderer = new CigaretteRenderer()
           renderers.set(rendererKey(pen), renderer)
         }
-        renderer.draw(ctx, pen, cigaretteSettings, now, emberDir, lit, kind)
+        renderer.draw(actx, pen, cigaretteSettings, now, emberDir, lit, kind, look)
       }
       if (overlayMode !== 'frame') {
-        for (const p of frame.persons) if (p.pen) drawCigarette(p.pen, p.emberDir, isLit(p.id), p.kind ?? 'cigarette')
+        for (const p of frame.persons) {
+          if (!p.pen) continue
+          // STEP 10：燃え具合（巻紙の長さ・灰・シケモク）
+          const life = fireFrame.lives.get(String(p.id))
+          const look: CigaretteLook | undefined = life
+            ? { progress: life.progress, ash: fireSettings.ash.enabled ? life.ash : 0, flash: life.flash, butt: life.state === 'BUTT' }
+            : undefined
+          drawCigarette(p.pen, p.emberDir, isLit(p.id), p.kind ?? 'cigarette', look)
+        }
         // 人物に対応付けられないペン：未着火のタバコとして描く（着火・煙の対象にしない）
         for (const u of frame.unassigned) drawCigarette(u.pen, u.emberDir, false, u.kind)
       }
-      if (fireFrame.lighter && overlayMode !== 'frame') drawLighter(ctx, fireFrame.lighter, lighterPressedRef.current)
-      fireRef.current.draw(ctx, now)
+      if (fireFrame.lighter && overlayMode !== 'frame') drawLighter(actx, fireFrame.lighter, lighterPressedRef.current)
+      fireRef.current.draw(actx, now)
 
       // 煙：人物ごとの状態機械が発生源を 1 つだけ選び、その人物の粒子として出す（未着火なら出さない）
       const smokes = people.updateSmoke(frame, {
@@ -511,26 +748,34 @@ export function PenTracker() {
         isLit,
         testBurst: smokeSettings.enabled && now < testBurstUntilRef.current,
       })
-      people.drawSmoke(ctx, smokeSettings)
+      people.drawSmoke(actx, smokeSettings)
 
       if (overlayMode !== 'cg') {
-        for (const pen of frame.pens) drawDetection(ctx, pen, colorLabel(colorSettingsRef.current.colors, pen))
+        for (const pen of frame.pens) drawDetection(actx, pen, colorLabel(colorSettingsRef.current.colors, pen))
       }
-      if (fireFrame.lighter && overlayMode !== 'cg') drawLighterFrame(ctx, fireFrame.lighter)
+      if (fireFrame.lighter && overlayMode !== 'cg') drawLighterFrame(actx, fireFrame.lighter)
+      // 遠距離認識の ROI（開発者向けの表示のときだけ）
+      if (devModeRef.current && rois.length > 0) drawRois(actx, rois)
       if (smokeSettings.showDebug) {
         for (const p of frame.persons) {
-          drawDebug(ctx, {
+          drawDebug(actx, {
             mouth: p.face,
             placement: p.placement,
             smokeSource: smokes.find((x) => x.personId === p.id)?.source ?? null,
             settings: smokeSettings,
           })
         }
-        if (mode !== 1) drawPersonDebug(ctx, frame)
-        drawFireDebug(ctx, {
+        if (mode !== 1) drawPersonDebug(actx, frame)
+      }
+      // STEP 11：手の骨格・炎と火側の端の距離・着火距離の円（煙のデバッグ表示か、開発者向けの表示のとき）
+      if (smokeSettings.showDebug || devModeRef.current) {
+        drawFireDebug(actx, {
           hands,
           fire: fireFrame,
           placements: frame.persons.flatMap((p) => (p.placement ? [p.placement] : [])),
+          pairs: frame.persons.flatMap((p) =>
+            p.placement ? [{ placement: p.placement, ignition: fireFrame.ignitions.get(String(p.id)) ?? null }] : [],
+          ),
           igniteDistance: fireSettings.ignition.igniteDistance,
           snapDistance: (key) => fireRef.current.snap.debug(key)?.distance ?? null,
         })
@@ -568,6 +813,38 @@ export function PenTracker() {
           lighterFound: fireFrame.lighter !== null,
           hands: hands.length,
           snapDistance: hands[0] ? (fireRef.current.snap.debug(hands[0].key)?.distance ?? null) : null,
+          cigaretteLength: primary?.placement?.length ?? null,
+          snapHands: hands.flatMap((h) => {
+            const d = fireRef.current.snap.debug(h.key)
+            return d
+              ? [{ ...d, key: h.key, side: h.side, tap: fireRef.current.taps.debug(h.key), hold: fireFrame.handViews.get(h.key) ?? null, wave: fireRef.current.waves.debug(h.key) }]
+              : []
+          }),
+          snapAttempts: fireRef.current.snap.recentAttempts,
+          snapSuccesses: fireRef.current.snap.successes,
+          flameRemaining: fireRef.current.flames.remaining(now),
+          lives: [...fireFrame.lives].map(([key, l]) => ({
+            key,
+            state: l.state,
+            burnMs: l.burnMs,
+            ash: l.ash,
+            exitCandidate: l.exitCandidate,
+            exited: l.exited,
+          })),
+          exhale: smokes.map((x) => ({
+            personId: x.personId,
+            facing: x.facing,
+            frontal: x.source?.kind === 'mouth' ? x.source.frontal : null,
+            side: x.source?.kind === 'mouth' ? Math.sign(x.source.direction.x) : null,
+          })),
+          ashParticles: fireRef.current.ash.particleCount,
+          cameraWidth: streamRef.current?.getVideoTracks()[0]?.getSettings().width ?? video.videoWidth,
+          cameraHeight: streamRef.current?.getVideoTracks()[0]?.getSettings().height ?? video.videoHeight,
+          detectMs,
+          roiMs,
+          rois: rois.length,
+          roiPens,
+          predictedPens: frame.pens.filter((p) => p.predicted).length,
           persons: frame.persons.map((p) => ({
             id: p.id,
             face: p.face ? p.face.status : 'lost',
@@ -610,10 +887,136 @@ export function PenTracker() {
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
-  }, [cv, stopCamera])
+  }, [cv, stopCamera, watchTrackEnd])
 
   // アンマウント時にカメラ・描画ループ・OpenCV の Mat をすべて解放
   useEffect(() => stopCamera, [stopCamera])
+
+  /**
+   * STEP 9：インカメラ・アウトカメラの切り替え。描画ループ・OpenCV・MediaPipe はそのまま使い、video の映像だけを差し替える。
+   * 切り替え中は操作を受け付けず（連打しても 1 回）、失敗したら元のカメラに戻す。戻せなければカメラを止める。
+   */
+  const switchCamera = useCallback(async () => {
+    const video = videoRef.current
+    const old = streamRef.current
+    if (!video || !old) return
+    switcherRef.current ??= new CameraSwitcher((c) => navigator.mediaDevices.getUserMedia(c))
+    const switcher = switcherRef.current
+    if (switcher.busy) return
+    const session = sessionRef.current
+    const from = facingRef.current
+    const target: CameraFacing = from === 'user' ? 'environment' : 'user'
+    setSwitching(true)
+    setToast(null)
+    // 切り替え前のタバコ・炎・煙・追跡が新しいカメラの映像に残らないよう、先に消す
+    resetTrackingAll()
+    streamRef.current = null
+    try {
+      const result = await switcher.switchTo(target, { stream: old, facing: from })
+      if (!result) return
+      if (session !== sessionRef.current) {
+        // 切り替え中にカメラが止められた
+        result.stream.getTracks().forEach((t) => t.stop())
+        return
+      }
+      streamRef.current = result.stream
+      watchTrackEnd(result.stream)
+      video.srcObject = result.stream
+      await video.play()
+      facingRef.current = result.facing
+      setFacing(result.facing)
+      // 左右反転はカメラに合わせる（インカメラは反転、アウトカメラは反転しない）。座標系が変わるので追跡を初期化する
+      const nextMirror = defaultMirror(result.facing)
+      mirrorRef.current = nextMirror
+      setMirror(nextMirror)
+      resetTrackingAll()
+      if (result.restored) {
+        setToast({ kind: 'error', text: `${FACING_LABELS[target]}に切り替えられなかったため、${FACING_LABELS[result.facing]}に戻しました` })
+      }
+    } catch (e) {
+      if (session !== sessionRef.current) return
+      stopCamera()
+      setError(`カメラを切り替えられませんでした: ${cameraErrorMessage(e)}`)
+    } finally {
+      setSwitching(false)
+    }
+  }, [resetTrackingAll, stopCamera, watchTrackEnd])
+
+  /** STEP 9：撮影。今の映像（フィルター）と AR を 1 枚に合成して、プレビューを開く */
+  const takePhoto = async () => {
+    const video = videoRef.current
+    if (cameraStatus !== 'running' || switching || capturing || previewOpen || !video) return
+    setCapturing(true)
+    setToast(null)
+    try {
+      const canvas = composePhoto({ video, overlay: overlayCanvasRef.current, mirror: mirrorRef.current, filter })
+      // STEP 14：直近 1 秒以内に検出した顔を、表示座標（処理解像度）から写真の座標へ
+      const recent = posterFacesRef.current
+      const frameWidth = overlayCanvasRef.current?.width ?? 0
+      const faces =
+        frameWidth > 0 && performance.now() - recent.at <= 1000 ? recent.faces.map((f) => scaleFace(f, canvas.width / frameWidth)) : []
+      const blob = await canvasToJpeg(canvas)
+      const thumb = makeThumb(canvas)
+      // 合成に使った canvas のメモリをすぐに解放する
+      canvas.width = 0
+      canvas.height = 0
+      setPhoto((prev) => {
+        if (prev?.url) URL.revokeObjectURL(prev.url)
+        return { blob, url: URL.createObjectURL(blob), thumb, saved: false, faces }
+      })
+      setPreviewOpen(true)
+    } catch (e) {
+      setToast({ kind: 'error', text: `撮影できませんでした：${e instanceof Error ? e.message : String(e)}` })
+    } finally {
+      setCapturing(false)
+    }
+  }
+
+  /** STEP 9：保存（iOS アプリは写真アプリ、Web 版はダウンロード）。保存したら写真のデータを解放する */
+  const savePreviewPhoto = async () => {
+    if (!photo?.blob || saving) return
+    setSaving(true)
+    try {
+      const target = await savePhoto(photo.blob, photoFileName())
+      setToast({ kind: 'ok', text: target === 'photos' ? '写真アプリに保存しました' : '画像をダウンロードしました' })
+      if (photo.url) URL.revokeObjectURL(photo.url)
+      setPhoto({ blob: null, url: null, thumb: photo.thumb, saved: true, faces: [] })
+      setPreviewOpen(false)
+      setPosterOpen(false)
+    } catch (e) {
+      setToast({ kind: 'error', text: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /** STEP 9：撮り直す（撮った写真は保存せずに捨てる） */
+  const retakePhoto = () => {
+    if (saving) return
+    if (photo?.url) URL.revokeObjectURL(photo.url)
+    setPhoto(null)
+    setPreviewOpen(false)
+    setPosterOpen(false)
+  }
+
+  // 画面の通知は 3 秒で消す
+  useEffect(() => {
+    if (!toast) return
+    const timer = setTimeout(() => setToast(null), 3000)
+    return () => clearTimeout(timer)
+  }, [toast])
+
+  // アンマウント時に写真の URL を解放する
+  const photoUrlRef = useRef<string | null>(null)
+  useEffect(() => {
+    photoUrlRef.current = photo?.url ?? null
+  }, [photo])
+  useEffect(
+    () => () => {
+      if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current)
+    },
+    [],
+  )
 
   // 口元検出（MediaPipe Face Landmarker）は、カメラ動作中かつ煙か自動方向補正が有効なとき
   // （STEP 5：複数人モードでは人物を顔で区別するので常に）だけ読み込む
@@ -743,6 +1146,26 @@ export function PenTracker() {
 
   return (
     <div className="pen-tracker">
+      <div className="main-column">
+      {/* STEP 9：上部の操作（フィルター・カメラの切り替え） */}
+      <div className="top-bar">
+        <div className="segmented filter-select" role="group" aria-label="フィルター">
+          {FILTER_IDS.map((id) => (
+            <button key={id} type="button" aria-pressed={filter === id} onClick={() => setFilter(id)}>
+              {FILTERS[id].label}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="switch-camera"
+          onClick={switchCamera}
+          disabled={!running || switching}
+          aria-label={`${FACING_LABELS[facing === 'user' ? 'environment' : 'user']}に切り替え`}
+        >
+          ⟲ {facing === 'user' ? 'アウト' : 'イン'}
+        </button>
+      </div>
       {/* 映像の比率に枠を合わせる（iOS 対応：縦向きの iPhone で映像が小さくならないように。起動前は 16:9） */}
       <div
         className="stage"
@@ -752,6 +1175,8 @@ export function PenTracker() {
         <canvas
           ref={canvasRef}
           className={`output-canvas${picking ? ' picking' : ''}`}
+          // STEP 9：フィルターは映像の canvas の表示だけにかける（canvas の画素＝ OpenCV の入力は元映像のまま）
+          style={{ filter: viewMode === 'camera' ? cssFilter(filter) : 'none' }}
           onPointerDown={(e) => {
             if (!picking) return
             const canvas = canvasRef.current
@@ -766,7 +1191,14 @@ export function PenTracker() {
             setPendingColor({ estimate, hsv: estimate.range, at, name: '' })
           }}
         />
+        {viewMode === 'camera' && vignetteCss(filter) && (
+          <div className="vignette" style={{ background: vignetteCss(filter)! }} aria-hidden="true" />
+        )}
+        {/* STEP 9：AR（タバコ CG・炎・煙）はフィルターの上に重ねる */}
+        <canvas ref={overlayCanvasRef} className="overlay-canvas" aria-hidden="true" />
         {picking && <div className="pick-hint">ペンの上をタップしてください</div>}
+        {switching && <div className="stage-loading">カメラを切り替え中…</div>}
+        {toast && !previewOpen && <div className={`toast toast-${toast.kind}`} role="status">{toast.text}</div>}
         {running && personMode === 1 && (
           <div className="stage-badges" aria-live="polite">
             <div className={`smoke-badge ignition-${ignitionState.toLowerCase()}`}>{ignitionState}</div>
@@ -808,18 +1240,49 @@ export function PenTracker() {
           </div>
         )}
       </div>
+      {/* STEP 9：下部の操作（カメラの起動・撮影・最後に撮った写真） */}
+      <div className="bottom-bar">
+        {running || cameraStatus === 'starting' ? (
+          <button type="button" className="camera-toggle" onClick={stopCamera} disabled={switching}>
+            カメラ停止
+          </button>
+        ) : (
+          <button type="button" className="camera-toggle" onClick={startCamera} disabled={cvStatus !== 'ready'}>
+            カメラ起動
+          </button>
+        )}
+        <button
+          type="button"
+          className="shutter"
+          onClick={takePhoto}
+          disabled={!running || switching || capturing || previewOpen}
+          aria-label="撮影"
+        >
+          <span />
+        </button>
+        <button
+          type="button"
+          className="photo-thumb"
+          disabled={!photo}
+          aria-label="撮影した写真"
+          onClick={() => {
+            if (photo?.url) setPreviewOpen(true)
+            else if (photo?.saved) setToast({ kind: 'info', text: '保存した写真は写真アプリで確認できます' })
+          }}
+        >
+          {photo ? <img src={photo.thumb} alt="" /> : <span>写真</span>}
+        </button>
+      </div>
+      </div>
 
+      <details className="settings" open={settingsOpen} onToggle={(e) => setSettingsOpen(e.currentTarget.open)}>
+      <summary>詳細設定</summary>
       <div className="panel">
+        <label className="checkbox dev-toggle">
+          <input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} />
+          開発者向けの表示（着火ジェスチャー・灰落とし・シケモク・吐煙のデバッグと強制操作）
+        </label>
         <div className="toolbar">
-          {running || cameraStatus === 'starting' ? (
-            <button type="button" onClick={stopCamera}>
-              カメラ停止
-            </button>
-          ) : (
-            <button type="button" onClick={startCamera} disabled={cvStatus !== 'ready'}>
-              カメラ起動
-            </button>
-          )}
           <div className="segmented" role="group" aria-label="表示切替">
             <button
               type="button"
@@ -1187,14 +1650,27 @@ export function PenTracker() {
               {ignitionState}
               {stats.ignition?.flameDistance != null &&
                 `（炎まで 全長 ×${stats.ignition.flameDistance.toFixed(2)}）`}
+              {devMode && stats.ignition && ` · ${stats.ignition.reason}`}
             </dd>
             <dt>炎</dt>
-            <dd>{stats.flames.length > 0 ? `表示中（${describeFlames(stats.flames)}）` : 'なし'}</dd>
+            <dd>
+              {stats.flames.length > 0 ? `表示中（${describeFlames(stats.flames)}）` : 'なし'}
+              {devMode &&
+                stats.flameRemaining.map((f, i) => (
+                  <span key={i}>{` · 残り ${(f.remainingMs / 1000).toFixed(1)} / ${(f.durationMs / 1000).toFixed(1)}秒`}</span>
+                ))}
+            </dd>
+            <dt>タバコの状態</dt>
+            <dd>
+              {stats.lives.length === 0
+                ? '—'
+                : stats.lives.map((l) => `${LIFE_LABELS[l.state]}（${(l.burnMs / 1000).toFixed(0)} / ${BURN_LIFETIME_MS / 1000}秒）`).join('、')}
+            </dd>
             <dt>手</dt>
             <dd>
               {describeFaceStatus(handStatus, handResult?.error ?? null, running, handNeeded)}
               {handStatus === 'ready' &&
-                ` · ${stats.hands} 本${stats.snapDistance !== null ? ` · 親指-中指 ×${stats.snapDistance.toFixed(2)}` : ''}`}
+                ` · ${stats.hands} 本${stats.snapDistance !== null ? ` · 親指-人差し指 ×${stats.snapDistance.toFixed(2)}` : ''}`}
             </dd>
             <dt>ライター</dt>
             <dd>{!fire.lighterEnabled ? '無効' : running ? (stats.lighterFound ? '検出中' : '未検出') : '—'}</dd>
@@ -1260,7 +1736,7 @@ export function PenTracker() {
               checked={fire.snapEnabled}
               onChange={(e) => updateFire({ snapEnabled: e.target.checked })}
             />
-            指パッチン認識（MediaPipe Hand Landmarker）
+            着火ジェスチャー（親指と人差し指、MediaPipe Hand Landmarker）
           </label>
           <label className="checkbox">
             <input
@@ -1269,6 +1745,14 @@ export function PenTracker() {
               onChange={(e) => updateFire({ lighterEnabled: e.target.checked })}
             />
             長方形の小物をライターにする
+          </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={fire.waveExtinguish}
+              onChange={(e) => updateFire({ waveExtinguish: e.target.checked })}
+            />
+            手を振ると指先の火が消える
           </label>
           <Slider
             label="着火距離"
@@ -1279,42 +1763,281 @@ export function PenTracker() {
             format={(v) => `×${v.toFixed(2)}`}
             onChange={(v) => updateFire({ ignition: { ...fire.ignition, igniteDistance: v } })}
           />
-          <h3>指パッチン</h3>
+          <h3>着火ジェスチャー（親指と人差し指）</h3>
+          <p className="note">
+            炎の表示時間 {(FLAME_DURATION_MS / 1000).toFixed(1)} 秒（STEP 9 までは {(PREVIOUS_FLAME_DURATION_MS / 1000).toFixed(1)} 秒）。
+          </p>
           <Slider
             label="接触距離"
             value={fire.snap.contactDistance}
             min={0.1}
-            max={0.8}
-            step={0.05}
+            max={0.6}
+            step={0.02}
             format={(v) => `×${v.toFixed(2)}`}
             onChange={(v) =>
               updateFire({
-                snap: { ...fire.snap, contactDistance: v, releaseDistance: Math.max(fire.snap.releaseDistance, v + 0.1) },
+                snap: { ...fire.snap, contactDistance: v, releaseDistance: Math.max(fire.snap.releaseDistance, v + 0.15) },
               })
             }
           />
           <Slider
-            label="弾く距離"
+            label="接触の解除距離"
+            value={fire.snap.contactExitDistance}
+            min={0.1}
+            max={1}
+            step={0.02}
+            format={(v) => `×${v.toFixed(2)}`}
+            onChange={(v) => updateFire({ snap: { ...fire.snap, contactExitDistance: v } })}
+          />
+          <Slider
+            label="離れる距離"
             value={fire.snap.releaseDistance}
             min={0.3}
-            max={1.5}
+            max={1.2}
             step={0.05}
             format={(v) => `×${v.toFixed(2)}`}
             onChange={(v) =>
               updateFire({
-                snap: { ...fire.snap, releaseDistance: v, contactDistance: Math.min(fire.snap.contactDistance, v - 0.1) },
+                snap: { ...fire.snap, releaseDistance: v, contactDistance: Math.min(fire.snap.contactDistance, v - 0.15) },
               })
             }
           />
           <Slider
-            label="弾く速さ"
+            label="離れる速さ"
             value={fire.snap.minSpeed}
             min={0.5}
-            max={10}
-            step={0.5}
+            max={6}
+            step={0.1}
             format={(v) => `${v.toFixed(1)}/s`}
             onChange={(v) => updateFire({ snap: { ...fire.snap, minSpeed: v } })}
           />
+          <Slider
+            label="接触時間"
+            value={fire.snap.minContactMs}
+            min={0}
+            max={300}
+            step={10}
+            format={(v) => `${v}ms`}
+            onChange={(v) => updateFire({ snap: { ...fire.snap, minContactMs: v } })}
+          />
+          <Slider
+            label="離す制限時間"
+            value={fire.snap.maxReleaseMs}
+            min={100}
+            max={800}
+            step={20}
+            format={(v) => `${v}ms`}
+            onChange={(v) => updateFire({ snap: { ...fire.snap, maxReleaseMs: v } })}
+          />
+          <Slider
+            label="クールダウン"
+            value={fire.snap.cooldownMs}
+            min={200}
+            max={3000}
+            step={100}
+            format={(v) => `${(v / 1000).toFixed(1)}秒`}
+            onChange={(v) => updateFire({ snap: { ...fire.snap, cooldownMs: v } })}
+          />
+          {devMode && (
+            <details className="snap-debug" open>
+              <summary>着火ジェスチャー・灰落としのデバッグ（着火 成功 {stats.snapSuccesses} 回）</summary>
+              <div className="toolbar fire-actions">
+                <button
+                  type="button"
+                  disabled={!running}
+                  onClick={() => {
+                    // 着火ジェスチャーを使わずに炎だけを出す（手があれば人差し指の先端、無ければタバコの火側の端）
+                    manualFlameRef.current = true
+                    dirtyRef.current = true
+                  }}
+                >
+                  炎を出す（テスト）
+                </button>
+                <button
+                  type="button"
+                  disabled={!running}
+                  onClick={() => {
+                    // 炎を使わずにタバコだけを着火する（シケモクは着火しない）
+                    fireRef.current.lightAll(personsRef.current.personIds.map(String))
+                    dirtyRef.current = true
+                  }}
+                >
+                  タバコを着火（テスト）
+                </button>
+              </div>
+              <dl className="readout">
+                <dt>手の認識</dt>
+                <dd>
+                  {handStatus === 'ready'
+                    ? `${stats.hands} 本 · 推論 ${stats.handHz.toFixed(0)} 回/秒`
+                    : describeFaceStatus(handStatus, handResult?.error ?? null, running, handNeeded)}
+                </dd>
+                <dt>炎の有効時間</dt>
+                <dd>
+                  {stats.flameRemaining.length === 0
+                    ? 'なし'
+                    : stats.flameRemaining.map((f) => `残り ${(f.remainingMs / 1000).toFixed(1)} / ${(f.durationMs / 1000).toFixed(1)}秒`).join('、')}
+                </dd>
+                <dt>炎と火側の端</dt>
+                <dd>
+                  {stats.ignition?.flameDistance != null
+                    ? `全長 ×${stats.ignition.flameDistance.toFixed(2)}（着火距離 ×${fire.ignition.igniteDistance.toFixed(2)}・${Math.round(stats.ignition.flameDistance * (stats.cigaretteLength ?? 0))}px / ${Math.round(fire.ignition.igniteDistance * (stats.cigaretteLength ?? 0))}px）`
+                    : '—'}
+                </dd>
+                <dt>着火の判定</dt>
+                <dd>{stats.ignition ? stats.ignition.reason : '—'}</dd>
+              </dl>
+              <ul>
+                {stats.snapHands.length === 0 && <li>手が映っていません</li>}
+                {stats.snapHands.map((h) => (
+                  <li key={h.key}>
+                    {h.key}（{h.side}・{h.mode === '3d' ? '3D' : '2D'}
+                    {h.confidence !== null && `・信頼度 ${h.confidence.toFixed(2)}`}・間隔 {Math.round(h.intervalMs)}ms）：
+                    {h.hold && `[${HOLD_LABELS[h.hold.state]}${h.hold.penKey ? `・${h.hold.penKey}` : ''}・握り ${h.hold.score.toFixed(2)}${h.hold.reason ? `・${h.hold.reason}` : ''}] `}
+                    {h.unreliable ? '信頼度が低いため判定しない' : SNAP_STATUS_LABELS[h.status]}
+                    {h.blocked && `（炎を止めた理由：${h.blocked}）`}
+                    {h.holding && '（ペンをつまんでいる）'}
+                    {` · 親指-人差し指 ×${h.distance.toFixed(2)} · 接触 ${Math.round(h.contactMs)}ms · 離れる速さ ${h.releaseSpeed.toFixed(1)}/s`}
+                    {h.cooldownMs > 0 && ` · クールダウン残り ${(h.cooldownMs / 1000).toFixed(1)}秒`}
+                    {h.wave && ` · 手を振る 折り返し ${h.wave.reversals}/${WAVE_MIN_REVERSALS} 速さ ${h.wave.peakSpeed.toFixed(1)}/${WAVE_MIN_SPEED}`}
+                    {h.tap &&
+                      ` · タップ ${h.tap.targetKey ? `${TAP_PHASE_LABELS[h.tap.phase]} ×${Number.isFinite(h.tap.distance) ? h.tap.distance.toFixed(2) : '—'} ${h.tap.taps}回` : '対象なし'}${h.tap.lastReason ? `（${h.tap.lastReason}）` : ''}`}
+                  </li>
+                ))}
+              </ul>
+              <ol className="snap-attempts">
+                {stats.snapAttempts.map((a) => (
+                  <li key={`${a.handKey}-${a.time}`} className={a.ok ? 'ok' : 'ng'}>
+                    {a.ok ? '成功' : '失敗'}（{a.handKey}・{a.mode === '3d' ? '3D' : '2D'}・接触 {Math.round(a.contactMs)}ms・離れる速さ {a.speed.toFixed(1)}・手首 {a.wristSpeed.toFixed(1)}）
+                    {!a.ok && `：${a.reasons.join('、')}`}
+                  </li>
+                ))}
+              </ol>
+              <p className="note">
+                「接触 → 離す」を 1 回評価するたびに記録します（新しい順）。距離は 2D を基本にし、3D のワールドランドマークが安定していれば小さい方を使います。
+              </p>
+            </details>
+          )}
+          <h3>灰落とし（人差し指で 2 回トントン）</h3>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={fire.ash.enabled}
+              onChange={(e) => updateFire({ ash: { ...fire.ash, enabled: e.target.checked } })}
+            />
+            灰を表示し、トントンで落とす
+          </label>
+          <Slider
+            label="叩く距離"
+            value={fire.ash.tapNear}
+            min={0.02}
+            max={0.4}
+            step={0.02}
+            format={(v) => `×${v.toFixed(2)}`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, tapNear: v, tapFar: Math.max(fire.ash.tapFar, v + 0.08) } })}
+          />
+          <Slider
+            label="離す距離"
+            value={fire.ash.tapFar}
+            min={0.1}
+            max={0.8}
+            step={0.02}
+            format={(v) => `×${v.toFixed(2)}`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, tapFar: v, tapNear: Math.min(fire.ash.tapNear, v - 0.08) } })}
+          />
+          <Slider
+            label="叩く速さ"
+            value={fire.ash.tapMinSpeed}
+            min={0.2}
+            max={5}
+            step={0.1}
+            format={(v) => `${v.toFixed(1)}/s`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, tapMinSpeed: v } })}
+          />
+          <Slider
+            label="タップ回数"
+            value={fire.ash.taps}
+            min={1}
+            max={4}
+            step={1}
+            format={(v) => `${v}回`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, taps: v } })}
+          />
+          <Slider
+            label="タップの制限時間"
+            value={fire.ash.tapWindowMs}
+            min={400}
+            max={2500}
+            step={100}
+            format={(v) => `${(v / 1000).toFixed(1)}秒`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, tapWindowMs: v } })}
+          />
+          <Slider
+            label="灰のクールダウン"
+            value={fire.ash.cooldownMs}
+            min={200}
+            max={4000}
+            step={100}
+            format={(v) => `${(v / 1000).toFixed(1)}秒`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, cooldownMs: v } })}
+          />
+          <Slider
+            label="灰の成長速度"
+            value={fire.ash.growthRate}
+            min={0}
+            max={0.03}
+            step={0.001}
+            format={(v) => `全長 ×${(v * 100).toFixed(1)}%/秒`}
+            onChange={(v) => updateFire({ ash: { ...fire.ash, growthRate: v } })}
+          />
+          {devMode && (
+            <div className="toolbar fire-actions">
+              <button
+                type="button"
+                disabled={!running}
+                onClick={() => {
+                  fireRef.current.requestAshDrop()
+                  dirtyRef.current = true
+                }}
+              >
+                灰を落とす（テスト）
+              </button>
+              <button
+                type="button"
+                disabled={!running}
+                onClick={() => {
+                  fireRef.current.forceButt(personsRef.current.personIds.map(String))
+                  personsRef.current.resetSmoke()
+                  dirtyRef.current = true
+                }}
+              >
+                強制シケモク化
+              </button>
+              <button
+                type="button"
+                disabled={!running}
+                onClick={() => {
+                  fireRef.current.renew(personsRef.current.personIds.map(String))
+                  personsRef.current.resetSmoke()
+                  dirtyRef.current = true
+                }}
+              >
+                新品に戻す（強制リセット）
+              </button>
+            </div>
+          )}
+          {devMode && (
+            <ul className="snap-debug">
+              {stats.lives.map((l) => (
+                <li key={l.key}>
+                  人物 {l.key}：{LIFE_LABELS[l.state]} · 燃焼 {(l.burnMs / 1000).toFixed(1)} 秒 · 灰 全長 ×{l.ash.toFixed(3)}
+                  {l.exitCandidate && ' · 画面の端で見失った（退出の候補）'}
+                  {l.exited && ' · 退出を確定（次に映ったら新品）'}
+                </li>
+              ))}
+              <li>落ちている灰の粒子 {stats.ashParticles} 個</li>
+            </ul>
+          )}
           <Slider
             label="手の推論間隔"
             value={fire.handIntervalMs}
@@ -1345,7 +2068,7 @@ export function PenTracker() {
             />
           ))}
           <p className="note">
-            指パッチン：親指と中指を押し付けてから素早く弾くと、親指の先に炎が出ます（手の大きさで正規化、両手対応、0.9 秒のクールダウン）。炎にタバコの火側の端を近づけると着火（LIT）し、着火後だけ吸う・吐くの煙が出ます。ライターは単色の長方形の小物（既定は青）を認識し、ボタンを押している間だけ火口に炎を出します。着火距離はタバコの全長に対する倍率。
+            着火ジェスチャー：親指と人差し指の先をくっつけてから素早く離すと、人差し指の先に炎が 5 秒出て、指先に追従します（手の大きさで正規化した距離で判定し、手のひら・手の甲・斜めのどれでも判定する想定。両手対応。ペンをつまんでいる指では判定しません）。着火中のタバコを人差し指で 2 回トントンと叩くと灰が落ちます。着火から 60 秒燃えるとシケモクになり、画面の外に出して戻すと新品になります。炎にタバコの火側の端を近づけると着火（LIT）し、着火後だけ吸う・吐くの煙が出ます。ライターは単色の長方形の小物（既定は青）を認識し、ボタンを押している間だけ火口に炎を出します。着火距離はタバコの全長に対する倍率。
           </p>
         </section>
 
@@ -1368,6 +2091,19 @@ export function PenTracker() {
             />
             煙エフェクトを有効にする
           </label>
+          {devMode && (
+            <ul className="snap-debug">
+              {stats.exhale.length === 0 && <li>吐煙：人物がいません</li>}
+              {stats.exhale.map((x) => (
+                <li key={x.personId}>
+                  人物 {x.personId}：顔の向き {x.facing === null ? '—' : `${x.facing >= 0 ? '+' : ''}${x.facing.toFixed(2)}`}
+                  {x.frontal !== null
+                    ? ` · 吐煙 正面 ${Math.round(x.frontal * 100)}% / 横（${x.side! > 0 ? '右' : '左'}）${Math.round((1 - x.frontal) * 100)}%`
+                    : ' · 吐煙なし'}
+                </li>
+              ))}
+            </ul>
+          )}
           <dl className="readout">
             <dt>顔検出</dt>
             <dd>{describeFaceStatus(faceStatus, faceResult?.error ?? null, running, faceNeeded)}</dd>
@@ -1526,7 +2262,30 @@ export function PenTracker() {
                 ? `${stats.frameWidth}×${stats.frameHeight} / ${stats.fps.toFixed(1)} fps`
                 : '—'}
             </dd>
+            <dt>カメラ</dt>
+            <dd>{running && stats.cameraWidth > 0 ? `${stats.cameraWidth}×${stats.cameraHeight}（実際の取得解像度）` : '—'}</dd>
+            <dt>検出時間</dt>
+            <dd>
+              {running
+                ? `全画面 ${stats.detectMs.toFixed(1)}ms${far.enabled ? ` · ROI ${stats.roiMs.toFixed(1)}ms（${stats.rois} 個、${ROI_IMAGE_SIZE}×${ROI_IMAGE_SIZE}）` : ''}`
+                : '—'}
+            </dd>
+            {far.enabled && (
+              <>
+                <dt>遠距離</dt>
+                <dd>{running ? `ROI で検出 ${stats.roiPens} 本 · 予測で表示中 ${stats.predictedPens} 本` : '—'}</dd>
+              </>
+            )}
           </dl>
+          <label className="checkbox">
+            <input type="checkbox" checked={far.enabled} onChange={(e) => setFar({ enabled: e.target.checked })} />
+            遠距離認識モード（顔・手の近くを高解像度で探し、小さく写ったペンも認識する。実験的・初期値 OFF）
+          </label>
+          <p className="note">
+            遠距離認識モード：全画面の検出は従来のまま行い、小さく写った顔・手の近く（最大 {MAX_ROIS[1]}〜{MAX_ROIS[3]} か所）だけ、カメラの映像から{' '}
+            {ROI_IMAGE_SIZE}px 四方で切り出して探します。ROI 内は面積 {FAR_CRITERIA.minArea}px² 以上・縦横比 {FAR_CRITERIA.minAspect} 以上・形状スコア{' '}
+            {FAR_CRITERIA.minScore} 以上（全画面より厳しい）。見失ったときは {FAR_HOLD_MS}ms まで、直前の動きから予測した位置に CG を薄くして表示します（予測は検出とは別に数えます）。重い場合は OFF にすると元の処理に戻ります。
+          </p>
           <p className="note">
             座標は表示画像（左右反転後）基準。角度は右方向 0°・時計回り正（0〜180°）。
           </p>
@@ -1624,6 +2383,33 @@ export function PenTracker() {
           </label>
         </section>
       </div>
+      </details>
+
+      {/* STEP 9：撮影した写真のプレビュー（保存 / 撮り直す） */}
+      {previewOpen && photo?.url && (
+        <div className="photo-preview" role="dialog" aria-modal="true" aria-label="撮影した写真">
+          <img src={photo.url} alt="撮影した写真" />
+          <div className="photo-actions">
+            <button type="button" onClick={retakePhoto} disabled={saving}>
+              撮り直す
+            </button>
+            <button type="button" onClick={() => setPosterOpen(true)} disabled={saving || !photo.blob}>
+              ポスターにする
+            </button>
+            <button type="button" className="primary" onClick={savePreviewPhoto} disabled={saving}>
+              {saving ? '保存中…' : '保存'}
+            </button>
+          </div>
+          {toast && !posterOpen && <div className={`toast toast-${toast.kind}`} role="status">{toast.text}</div>}
+        </div>
+      )}
+      {/* STEP 14：映画ポスターにする（作風の選択・AI のタイトル生成・文字の編集・保存 / 共有） */}
+      {previewOpen && posterOpen && photo?.blob && (
+        <>
+          <PosterEditor photo={photo.blob} faces={photo.faces} onClose={() => setPosterOpen(false)} onToast={setToast} />
+          {toast && <div className={`toast toast-${toast.kind} poster-toast`} role="status">{toast.text}</div>}
+        </>
+      )}
     </div>
   )
 }
@@ -1711,6 +2497,23 @@ function colorLabel(colors: PenColor[], pen: IdentifiedPen): string {
   return `P${pen.id} ${name}${pen.score !== null ? ` ${pen.score.toFixed(2)}` : ''}`
 }
 
+/** STEP 10：表示用のラベル */
+const LIFE_LABELS: Record<CigaretteState, string> = { NEW: '新品', BURNING: '燃焼中', BUTT: 'シケモク' }
+/** STEP 11：着火ジェスチャーの表示用の状態 */
+const SNAP_STATUS_LABELS: Record<SnapDebug['status'], string> = {
+  open: '離れている',
+  contact: '接触中',
+  releasing: '離脱中',
+  success: '成功',
+  failed: '失敗',
+  cooldown: 'クールダウン',
+  blocked: '判定しない（タバコを持つ手）',
+  waitOpen: '指を開くまで待機（持つのをやめた直後）',
+}
+/** STEP 12：手がタバコを持っているかの表示 */
+const HOLD_LABELS: Record<HoldState, string> = { FREE: 'FREE', HOLDING: 'HOLDING', UNKNOWN: 'UNKNOWN' }
+const TAP_PHASE_LABELS: Record<TapDebug['phase'], string> = { far: '離れている', between: '近づいている', near: '叩いた位置' }
+
 function describeFlames(sources: ActiveFlame['source'][]): string {
   const label = { snap: '指パッチン', lighter: 'ライター', manual: '手動' } as const
   return [...new Set(sources)].map((s) => label[s]).join('・')
@@ -1728,13 +2531,38 @@ function drawLighterFrame(ctx: CanvasRenderingContext2D, d: PenDetection) {
   ctx.restore()
 }
 
-/** デバッグ表示：手の骨格、親指-中指の距離、炎の位置、着火距離の円、ライターの火口 */
+const ROI_COLORS: Record<Roi['kind'], string> = {
+  face: 'rgba(64, 196, 255, 0.9)',
+  hand: 'rgba(105, 240, 174, 0.9)',
+  track: 'rgba(255, 215, 64, 0.9)',
+  candidate: 'rgba(255, 128, 171, 0.9)',
+}
+const ROI_LABELS: Record<Roi['kind'], string> = { face: '顔', hand: '手', track: '追跡', candidate: '色の候補' }
+
+/** 遠距離認識の ROI（探索範囲）の枠 */
+function drawRois(ctx: CanvasRenderingContext2D, rois: Roi[]) {
+  ctx.save()
+  ctx.lineWidth = 1.5
+  ctx.setLineDash([6, 4])
+  ctx.font = 'bold 11px system-ui, sans-serif'
+  for (const r of rois) {
+    ctx.strokeStyle = ROI_COLORS[r.kind]
+    ctx.strokeRect(r.x, r.y, r.size, r.size)
+    ctx.fillStyle = ctx.strokeStyle
+    ctx.fillText(`ROI ${ROI_LABELS[r.kind]}`, r.x + 4, r.y + 13)
+  }
+  ctx.restore()
+}
+
+/** デバッグ表示：手の骨格、親指-人差し指の距離、炎の位置、着火距離の円、ライターの火口 */
 function drawFireDebug(
   ctx: CanvasRenderingContext2D,
   d: {
     hands: TrackedHand[]
     fire: FireFrame
     placements: CigarettePlacement[]
+    /** STEP 11：タバコ CG の配置と、その着火状態 */
+    pairs: { placement: CigarettePlacement; ignition: IgnitionOutput | null }[]
     igniteDistance: number
     snapDistance: (key: string) => number | null
   },
@@ -1751,15 +2579,32 @@ function drawFireDebug(
       ctx.lineTo(lm[b].x, lm[b].y)
     }
     ctx.stroke()
-    const { thumbTip, middleTip } = hand.sample
-    ctx.strokeStyle = '#ffd740'
-    ctx.beginPath()
-    ctx.moveTo(thumbTip.x, thumbTip.y)
-    ctx.lineTo(middleTip.x, middleTip.y)
-    ctx.stroke()
+    // STEP 10：着火ジェスチャーは親指と人差し指の距離
+    const { thumbTip, indexTip } = hand.sample
+    if (indexTip) {
+      ctx.strokeStyle = '#ffd740'
+      ctx.beginPath()
+      ctx.moveTo(thumbTip.x, thumbTip.y)
+      ctx.lineTo(indexTip.x, indexTip.y)
+      ctx.stroke()
+    }
     const dist = d.snapDistance(hand.key)
     ctx.fillStyle = '#ffd740'
-    ctx.fillText(`${hand.side} ${dist !== null ? `×${dist.toFixed(2)}` : ''}`, thumbTip.x + 6, thumbTip.y - 6)
+    const hold = d.fire.handViews.get(hand.key)
+    ctx.fillText(
+      `${hand.key} ${hold ? hold.state : ''}${hold?.penKey ? `→${hold.penKey}` : ''} ${dist !== null ? `×${dist.toFixed(2)}` : ''}`,
+      thumbTip.x + 6,
+      thumbTip.y - 6,
+    )
+    // STEP 9：炎を出す位置（人差し指の先端）
+    const tip = hand.sample.indexTip
+    if (tip) {
+      ctx.strokeStyle = '#ff6d00'
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      ctx.arc(tip.x, tip.y, 6, 0, Math.PI * 2)
+      ctx.stroke()
+    }
   }
   for (const placement of d.placements) {
     ctx.strokeStyle = 'rgba(255, 82, 82, 0.9)'
@@ -1770,13 +2615,31 @@ function drawFireDebug(
     ctx.setLineDash([])
   }
   for (const f of d.fire.flames) {
+    // STEP 11：着火判定に使う炎の線分（根元〜先端）
     ctx.strokeStyle = '#ffffff'
     ctx.lineWidth = 2
     ctx.beginPath()
-    ctx.arc(f.position.x, f.position.y, 5, 0, Math.PI * 2)
+    ctx.moveTo(f.base.x, f.base.y)
+    ctx.lineTo(f.tip.x, f.tip.y)
+    ctx.stroke()
+    ctx.beginPath()
+    ctx.arc(f.base.x, f.base.y, 4, 0, Math.PI * 2)
     ctx.stroke()
     ctx.fillStyle = '#ffffff'
-    ctx.fillText(f.source, f.position.x + 8, f.position.y + 4)
+    ctx.fillText(f.source, f.base.x + 8, f.base.y + 4)
+  }
+  // STEP 11：タバコごとに、火側の端から最も近い炎の点までの線と距離（着火距離内なら緑）
+  for (const { placement: target, ignition: ig } of d.pairs) {
+    if (!ig?.nearestFlamePoint || ig.flameDistance === null) continue
+    const near = ig.flameDistance <= d.igniteDistance
+    ctx.strokeStyle = near ? '#69f0ae' : '#ff5252'
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    ctx.moveTo(target.emberEnd.x, target.emberEnd.y)
+    ctx.lineTo(ig.nearestFlamePoint.x, ig.nearestFlamePoint.y)
+    ctx.stroke()
+    ctx.fillStyle = ctx.strokeStyle
+    ctx.fillText(`×${ig.flameDistance.toFixed(2)} / ×${d.igniteDistance.toFixed(2)}`, target.emberEnd.x + 8, target.emberEnd.y + 16)
   }
   if (d.fire.lighterNozzle) {
     ctx.fillStyle = '#448aff'

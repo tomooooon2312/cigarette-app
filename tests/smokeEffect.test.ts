@@ -16,8 +16,9 @@ const MOUTH: SmokeSource = {
   position: { x: 300, y: 200 },
   scale: 20,
   direction: { x: 1, y: 0 },
+  frontal: 0,
 }
-const EMBER: SmokeSource = { kind: 'ember', position: { x: 300, y: 200 }, scale: 10, direction: { x: 0, y: -1 } }
+const EMBER: SmokeSource = { kind: 'ember', position: { x: 300, y: 200 }, scale: 10, direction: { x: 0, y: -1 }, frontal: 0 }
 
 // 乱数を固定して結果を再現可能にする
 const realRandom = Math.random

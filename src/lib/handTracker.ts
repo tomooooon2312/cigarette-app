@@ -1,6 +1,7 @@
 import type { HandLandmarker } from '@mediapipe/tasks-vision'
 import { loadVision, modelUrl } from './mediapipeVision'
 import type { Point2 } from './penGeometry'
+import { assignHandKeys, toDisplayPoint } from './handKeys'
 import type { HandSample } from './snapDetector'
 
 const MODEL_URL = modelUrl('hand_landmarker.task')
@@ -9,12 +10,17 @@ const MODEL_URL = modelUrl('hand_landmarker.task')
 const WRIST = 0
 const THUMB_TIP = 4
 const INDEX_MCP = 5
+/** STEP 10：人差し指の第 2 関節（灰落としのタップの判定） */
+const INDEX_PIP = 6
+/** STEP 9：人差し指の先端（炎を出す位置。STEP 10 から着火ジェスチャー・灰落としにも使う） */
+const INDEX_TIP = 8
 const MIDDLE_MCP = 9
 const MIDDLE_TIP = 12
 const PINKY_MCP = 17
 
-/** 前回の手の手首からこの距離（手の大きさ × この値）以内なら同じ手とみなす */
-const HAND_MATCH_DISTANCE = 1.5
+
+/** STEP 11：手を見失ってから、この時間以内に映った手には前のキーを引き継ぐ ms（着火ジェスチャーの SNAP_TIMING.lostMs と同じ） */
+export const KEY_MEMORY_MS = 300
 
 /** 指パッチンは一瞬なので、既定ではカメラのフレームごとに推論する */
 export const DEFAULT_HAND_INTERVAL_MS = 0
@@ -42,6 +48,9 @@ export class HandTracker {
   private sampleCount = 0
   private hands: TrackedHand[] = []
   private numHands = 2
+  /** STEP 11：最後に手が映っていた推論結果（一瞬見失った後のキーの引き継ぎに使う） */
+  private recent: { hands: TrackedHand[]; time: number } | null = null
+  private lastSampleAt = -Infinity
 
   static async create(numHands = 2): Promise<HandTracker> {
     const { vision, fileset } = await loadVision()
@@ -86,12 +95,14 @@ export class HandTracker {
     const result = this.landmarker.detectForVideo(video, timestamp)
     const sampleId = ++this.sampleCount
     const previous = this.hands
-    const taken = new Set<string>()
     const next = result.landmarks.map((lm, i) => {
       const label = result.handedness[i]?.[0]?.categoryName
       // MediaPipe の左右は「ミラーされた自撮り画像」を前提にしている。入力は非ミラーの video なので入れ替える
       const side: TrackedHand['side'] = label === 'Left' ? 'right' : label === 'Right' ? 'left' : 'unknown'
-      const landmarks = lm.map((p) => ({ x: (mirror ? 1 - p.x : p.x) * width, y: p.y * height }))
+      const landmarks = lm.map((p) => toDisplayPoint(p, width, height, mirror))
+      // STEP 9：3D のワールドランドマーク（メートル）。距離は左右反転・カメラに対する手の回転に依存しないので、反転は適用しない
+      const w = result.worldLandmarks?.[i]
+      const p3 = (k: number) => ({ x: w![k].x, y: w![k].y, z: w![k].z })
       const sample: HandSample = {
         time: now,
         thumbTip: landmarks[THUMB_TIP],
@@ -99,43 +110,45 @@ export class HandTracker {
         wrist: landmarks[WRIST],
         indexMcp: landmarks[INDEX_MCP],
         pinkyMcp: landmarks[PINKY_MCP],
+        indexTip: landmarks[INDEX_TIP],
+        indexPip: landmarks[INDEX_PIP],
         scale: Math.hypot(
           landmarks[WRIST].x - landmarks[MIDDLE_MCP].x,
           landmarks[WRIST].y - landmarks[MIDDLE_MCP].y,
         ),
+        world:
+          w && w.length >= 21
+            ? {
+                thumbTip: p3(THUMB_TIP),
+                middleTip: p3(MIDDLE_TIP),
+                wrist: p3(WRIST),
+                indexMcp: p3(INDEX_MCP),
+                pinkyMcp: p3(PINKY_MCP),
+                middleMcp: p3(MIDDLE_MCP),
+                indexTip: p3(INDEX_TIP),
+              }
+            : undefined,
+        confidence: result.handedness[i]?.[0]?.score,
       }
       return { side, landmarks, sample }
     })
-    // STEP 5：手が 3 本以上になると結果の順番が入れ替わるため、前回の同じ側の手のうち手首が最も近いもののキーを引き継ぐ
-    // （指パッチンの途中経過を手ごとに正しく追跡するため）。1 人分（左右 1 本ずつ）なら従来どおり 'left' / 'right'
-    const keys: (string | null)[] = next.map(() => null)
-    const pairs = next
-      .flatMap(({ side, sample }, i) =>
-        previous
-          .filter((h) => h.side === side)
-          .map((h) => ({ i, key: h.key, d: Math.hypot(h.sample.wrist.x - sample.wrist.x, h.sample.wrist.y - sample.wrist.y) }))
-          .filter((m) => m.d <= Math.max(sample.scale, 20) * HAND_MATCH_DISTANCE),
-      )
-      .sort((a, b) => a.d - b.d)
-    for (const { i, key } of pairs) {
-      if (keys[i] !== null || taken.has(key)) continue
-      keys[i] = key
-      taken.add(key)
-    }
-    this.hands = next.map(({ side, landmarks, sample }, i) => {
-      let key = keys[i]
-      for (let n = 0; key === null; n++) {
-        const candidate = n === 0 ? side : `${side}-${n}`
-        if (!taken.has(candidate)) key = candidate
-      }
-      taken.add(key)
-      return { key, side, landmarks, sampleId, sample }
-    })
+    // STEP 5：手が 3 本以上になると結果の順番が入れ替わるため、前回の手のうち手首が最も近いもののキーを引き継ぐ
+    // （着火ジェスチャーの途中経過を手ごとに正しく追跡するため）。1 人分（左右 1 本ずつ）なら従来どおり 'left' / 'right'
+    // STEP 11：一瞬見失った手（KEY_MEMORY_MS 以内）と、左右の推定が入れ替わった手（手の甲側・横向きで起きやすい）にも同じキーを引き継ぐ
+    if (previous.length > 0) this.recent = { hands: previous, time: this.lastSampleAt }
+    const memory = this.recent && now - this.recent.time <= KEY_MEMORY_MS ? this.recent.hands : []
+    const keys = assignHandKeys(
+      next.map(({ side, sample }) => ({ side, wrist: sample.wrist, scale: sample.scale })),
+      memory.map((h) => ({ key: h.key, side: h.side, wrist: h.sample.wrist })),
+    )
+    this.lastSampleAt = now
+    this.hands = next.map(({ side, landmarks, sample }, i) => ({ key: keys[i], side, landmarks, sampleId, sample }))
     return { hands: this.hands, fresh: true }
   }
 
   reset(): void {
     this.hands = []
+    this.recent = null
   }
 
   close(): void {

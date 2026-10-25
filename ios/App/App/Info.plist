@@ -26,6 +26,15 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>カメラの映像からペン・顔・手を認識し、タバコの CG と煙を重ねて表示するために使います。映像はこの iPhone の中だけで処理し、外部には送信しません。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>映画ポスターのタイトル・キャッチコピーを、同じネットワークの Mac のサーバー（npm run poster-server）で生成するために使います。写真は送信しません。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>撮影した AR の写真（タバコの CG・煙・炎を合成した画像）を写真アプリに保存するために使います。写真の読み取りはしません。</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -13,22 +13,50 @@ type Flame = {
   endsAt: number
   /** 追従させる手の番号（指パッチンの炎のみ） */
   handKey: string | null
+  /** STEP 9：手の位置を最後に受け取った時刻（手を見失ったらフェードアウトする） */
+  lastSeenAt: number
   seed: number
+  /** STEP 13：手を振って消した（フェードアウト中。着火判定には使わない） */
+  doused?: boolean
 }
 
 type Spark = { x: number; y: number; vx: number; vy: number; age: number; life: number; size: number }
 
-/** 指パッチン・手動の炎の表示時間 ms */
-export const SNAP_FLAME_MS = 2500
+/**
+ * 着火ジェスチャー（指パッチン）・手動の炎の表示時間 ms。STEP 10 で 2500 → 5000（2 倍）。
+ * 表示と着火判定は同じ炎の endsAt を使うので、炎が見えている間だけ着火できる。
+ */
+export const FLAME_DURATION_MS = 5000
+/** STEP 9 までの表示時間 ms（変更前の値。テストと仕様書の比較用） */
+export const PREVIOUS_FLAME_DURATION_MS = 2500
+/** 互換のための別名（STEP 4〜9 の名前） */
+export const SNAP_FLAME_MS = FLAME_DURATION_MS
 /** 出現・消滅時のフェード時間 ms */
 const FADE_IN_MS = 120
 const FADE_OUT_MS = 350
+/** STEP 13：手を振って消したときのフェードアウト ms */
+export const DOUSE_FADE_MS = 200
 /** 火の粉の上限（スマホでの負荷対策） */
 const MAX_SPARKS = 60
 const SPARK_RATE = 14
 const MAX_STEP_SEC = 0.1
 
-export type ActiveFlame = { source: FlameSource; position: Point2; size: number; intensity: number }
+export type ActiveFlame = {
+  source: FlameSource
+  /** 炎の胴体の中心（根元から高さの 45% 上） */
+  position: Point2
+  size: number
+  intensity: number
+  /** STEP 11：炎の根元（指先・火口。描画の基準と同じ点） */
+  base: Point2
+  /** STEP 11：炎の先端（根元から高さの FLAME_TIP_RATIO 上）。着火判定は根元〜先端の線分で行う */
+  tip: Point2
+  /** STEP 11：炎を出した手（指パッチン・手の指先の手動の炎。無ければ null） */
+  handKey: string | null
+}
+
+/** STEP 11：着火判定に使う炎の先端の高さ（炎の大きさに対する比率。描画する炎の高さ 0.6〜1.0 倍の中ほど） */
+export const FLAME_TIP_RATIO = 0.9
 
 /**
  * Canvas 2D による炎。
@@ -51,8 +79,9 @@ export class FlameEffect {
       position,
       size,
       startedAt: now,
-      endsAt: now + SNAP_FLAME_MS,
+      endsAt: now + FLAME_DURATION_MS,
       handKey,
+      lastSeenAt: now,
       seed: Math.random() * 1000,
     })
   }
@@ -77,28 +106,92 @@ export class FlameEffect {
         startedAt: now,
         endsAt: Infinity,
         handKey: null,
+        lastSeenAt: now,
         seed: Math.random() * 1000,
       })
     }
   }
 
-  /** 指パッチンの炎を、その手の指先に追従させる */
-  follow(handKey: string, position: Point2): void {
-    for (const f of this.flames) if (f.handKey === handKey) f.position = position
+  /** 指パッチンの炎を、その手の指先に追従させる（now を渡すと、手が見えている時刻として記録する） */
+  follow(handKey: string, position: Point2, now?: number): void {
+    for (const f of this.flames) {
+      if (f.handKey !== handKey) continue
+      f.position = position
+      if (now !== undefined) f.lastSeenAt = now
+    }
+  }
+
+  /**
+   * STEP 13：その手の炎（指パッチン・手動）を消す（手を振った）。DOUSE_FADE_MS でフェードアウトし、その間も着火には使わない。
+   * 消した炎があれば true。
+   */
+  douse(handKey: string, now: number): boolean {
+    let doused = false
+    for (const f of this.flames) {
+      if (f.handKey !== handKey || f.endsAt === Infinity || f.doused || now >= f.endsAt) continue
+      f.doused = true
+      f.endsAt = Math.min(f.endsAt, now + DOUSE_FADE_MS)
+      doused = true
+      // 振って消えるときの火の粉
+      for (let i = 0; i < 10 && this.sparks.length < MAX_SPARKS; i++) {
+        this.sparks.push({
+          x: f.position.x + (Math.random() - 0.5) * f.size * 0.3,
+          y: f.position.y - f.size * Math.random() * 0.6,
+          vx: (Math.random() - 0.5) * f.size * 2.4,
+          vy: -f.size * (0.3 + Math.random() * 0.8),
+          age: 0,
+          life: 0.25 + Math.random() * 0.3,
+          size: Math.max(f.size * 0.03, 1),
+        })
+      }
+    }
+    return doused
+  }
+
+  /** STEP 13：その手に、まだ消していない炎があるか */
+  hasLitFlame(handKey: string, now: number): boolean {
+    return this.flames.some((f) => f.handKey === handKey && f.endsAt !== Infinity && !f.doused && now < f.endsAt)
+  }
+
+  /** STEP 9：その手の炎の根元の位置（無ければ null） */
+  positionOf(handKey: string): Point2 | null {
+    return this.flames.find((f) => f.handKey === handKey && f.endsAt !== Infinity)?.position ?? null
+  }
+
+  /**
+   * STEP 9：手を holdMs より長く見失った炎は、その位置のままフェードアウトさせる（手が見えない間は位置を保持し、別の手には移さない）。
+   */
+  releaseLostHands(now: number, holdMs: number): void {
+    for (const f of this.flames) {
+      if (f.handKey === null || now - f.lastSeenAt <= holdMs) continue
+      // 最後に手が見えた時刻から holdMs 保持し、その後 FADE_OUT_MS でフェードアウトする（更新の間隔によらない）
+      f.endsAt = Math.min(f.endsAt, f.lastSeenAt + holdMs + FADE_OUT_MS)
+    }
+  }
+
+  /** STEP 10：表示時間のある炎（指パッチン・手動）の残り時間（デバッグ表示用。フェードアウトの時間を含む） */
+  remaining(now: number): { handKey: string | null; source: FlameSource; remainingMs: number; durationMs: number }[] {
+    return this.flames
+      .filter((f) => f.endsAt !== Infinity && now < f.endsAt)
+      .map((f) => ({ handKey: f.handKey, source: f.source, remainingMs: f.endsAt - now, durationMs: f.endsAt - f.startedAt }))
   }
 
   /**
    * 着火判定に使う、現在見えている炎（フェードアウト中も含む）。
    * position は炎の根元ではなく、炎の胴体の中心（根元から高さの 45% 上）。
+   * STEP 11：base・tip は描画と同じ根元の位置から求める（表示と着火判定で同じ座標を使う）。
    */
   active(now: number): ActiveFlame[] {
     return this.flames
-      .filter((f) => now >= f.startedAt && now < f.endsAt)
+      .filter((f) => now >= f.startedAt && now < f.endsAt && !f.doused)
       .map((f) => ({
         source: f.source,
         position: { x: f.position.x, y: f.position.y - f.size * 0.45 },
         size: f.size,
         intensity: this.intensity(f, now),
+        base: { ...f.position },
+        tip: { x: f.position.x, y: f.position.y - f.size * FLAME_TIP_RATIO },
+        handKey: f.handKey,
       }))
   }
 

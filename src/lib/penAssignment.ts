@@ -93,8 +93,8 @@ export function penMouthDistance(pen: AssignPen, person: AssignPerson): number {
   return Math.min(dist(pen.endpoints[0], person.mouth), dist(pen.endpoints[1], person.mouth)) / scale
 }
 
-/** 手の持ち主（最も近い顔）。2 位との差が小さいときは null */
-function handOwner(hand: AssignHand, persons: AssignPerson[]): number | null {
+/** 手の持ち主（最も近い顔）。2 位との差が小さいときは null。STEP 10：灰落としで、別の人の指で灰が落ちないように使う */
+export function handOwner(hand: AssignHand, persons: AssignPerson[]): number | null {
   const ranked = persons
     .map((p) => ({ id: p.id, d: dist(hand.wrist, p.mouth) / Math.max(p.faceScale, 1) }))
     .filter((r) => r.d <= ASSIGN_WEIGHTS.handOwnerMaxDistance)

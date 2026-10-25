@@ -10,7 +10,7 @@ import { FaceTrackManager, type TrackedFace } from './faceTracks'
 import type { TrackedHand } from './handTracker'
 import { MultiPenTracker, type IdentifiedPen, type PenInfo } from './multiPenTracker'
 import type { Mouth } from './mouthTracker'
-import { DEFAULT_ASSIGN, PenAssigner, type AssignSettings, type PenOwnership } from './penAssignment'
+import { DEFAULT_ASSIGN, PenAssigner, handOwner, type AssignSettings, type PenOwnership } from './penAssignment'
 import type { PenDetection, Point2 } from './penGeometry'
 import type { TrackingSettings } from './penTracking'
 import { MAX_PARTICLES, SmokeEffect, resolveSmokeSource, type SmokeSettings, type SmokeSource } from './smokeEffect'
@@ -34,6 +34,9 @@ type PersonRecord = {
   smoke: SmokeEffect
   /** 口元の煙を噴き出す向き（顔がほぼ正面のときは直前の向きを使う） */
   exhaleSide: number
+  /** STEP 10：煙の向きに使う、時間で平滑化した顔の向き（−1〜1）と、その更新時刻 */
+  exhaleFacing: number
+  exhaleFacingAt: number | null
   /** 最後に顔を検出した時刻 */
   lastSeenAt: number
   lastSmoke: SmokeFsmOutput
@@ -93,6 +96,8 @@ export type TrackFrame = {
   facesVisible: number
   /** このフレームで追跡データを破棄した人物 ID（着火状態の破棄に使う） */
   removedPersonIds: number[]
+  /** STEP 10：手のキー → 持ち主の人物 ID（1 人モードは全員その人物。複数人で曖昧なら null） */
+  handOwners: Map<string, number | null>
 }
 
 export type SmokeInput = {
@@ -106,7 +111,16 @@ export type SmokeInput = {
   testBurst: boolean
 }
 
-export type PersonSmoke = { personId: number; state: SmokeFsmOutput; source: SmokeSource | null }
+export type PersonSmoke = {
+  personId: number
+  state: SmokeFsmOutput
+  source: SmokeSource | null
+  /** STEP 10：煙の向きに使った、平滑化した顔の向き（−1 左 〜 0 正面 〜 1 右。顔が無ければ null） */
+  facing: number | null
+}
+
+/** STEP 10：煙の向きに使う顔の向きの平滑化の時定数 ms（急に向きが切り替わらないように） */
+export const EXHALE_FACING_TAU_MS = 180
 
 /**
  * STEP 5：複数人の顔・ペン・手の追跡と、人物ごとの状態の管理。
@@ -227,6 +241,8 @@ export class PersonController {
           smokeFsm: new SmokeStateMachine(),
           smoke: new SmokeEffect(),
           exhaleSide: 1,
+          exhaleFacing: 0,
+          exhaleFacingAt: null,
           lastSeenAt: now,
           lastSmoke: UNLIT_SMOKE,
         }
@@ -277,7 +293,17 @@ export class PersonController {
       .filter((p) => !persons.some((v) => v.pen?.id === p.id))
       .map((pen) => ({ pen, ...layout(pen, null), ownership: ownerOf.get(pen.id) ?? null }))
 
-    return { persons, unassigned, pens, facesVisible: faces.length, removedPersonIds }
+    // STEP 10：手の持ち主（灰落としで、その人のタバコだけを叩けるようにする）
+    const handOwners = new Map<string, number | null>()
+    const assignPersons = faces.map((f) => ({ id: f.id, mouth: f.center, faceScale: f.faceScale, velocity: f.velocity }))
+    for (const h of input.hands) {
+      handOwners.set(
+        h.key,
+        mode === 1 ? SOLO_PERSON_ID : handOwner({ points: h.landmarks, wrist: h.sample.wrist, scale: h.sample.scale }, assignPersons),
+      )
+    }
+
+    return { persons, unassigned, pens, facesVisible: faces.length, removedPersonIds, handOwners }
   }
 
   /** 人物ごとに煙の状態機械を進め、粒子を更新する（描画は drawSmoke） */
@@ -289,11 +315,22 @@ export class PersonController {
       if (!record) continue
       let state: SmokeFsmOutput = UNLIT_SMOKE
       let source: SmokeSource | null = null
+      // STEP 10：顔の向きを時間で平滑化してから煙の向きに使う（正面 ↔ 斜め ↔ 横が急に切り替わらない）
+      let facing: number | null = null
+      if (view.face) {
+        const dt = record.exhaleFacingAt === null ? Infinity : Math.max(now - record.exhaleFacingAt, 0)
+        const a = 1 - Math.exp(-dt / EXHALE_FACING_TAU_MS)
+        record.exhaleFacing += (view.face.facing - record.exhaleFacing) * a
+        record.exhaleFacingAt = now
+        facing = record.exhaleFacing
+      } else {
+        record.exhaleFacingAt = null
+      }
       if (settings.enabled) {
         const sourceInput = {
           emberEnd: view.placement?.emberEnd ?? null,
           cigaretteThickness: view.placement?.thickness ?? 0,
-          mouth: view.face,
+          mouth: view.face && facing !== null ? { center: view.face.center, width: view.face.width, facing } : null,
           frameWidth: input.frameWidth,
         }
         if (input.isLit(view.id)) {
@@ -328,11 +365,12 @@ export class PersonController {
             record.exhaleSide,
           )
         }
-        if (source?.kind === 'mouth') record.exhaleSide = Math.sign(source.direction.x) || 1
+        // 正面（横向きの成分がほぼ無い）のときは、直前の横の向きを保つ
+        if (source?.kind === 'mouth' && source.frontal < 0.5) record.exhaleSide = Math.sign(source.direction.x) || 1
       }
       record.smoke.update(now, source, settings)
       record.lastSmoke = state
-      out.push({ personId: view.id, state, source })
+      out.push({ personId: view.id, state, source, facing })
     }
     return out
   }

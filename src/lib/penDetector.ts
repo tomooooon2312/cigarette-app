@@ -1,4 +1,5 @@
 import type { Mat } from '@techstark/opencv-js'
+import { FAR_CRITERIA, ROI_IMAGE_SIZE, insideRoi, passesFarCriteria, roiScale, roiToFrame, type Roi } from './farDetection'
 import type { OpenCv } from './opencv'
 import { ACHROMATIC_SCORE_PENALTY, type PenColor } from './penColors'
 import { scorePenShape, type ShapeHand, type ShapeScore, type ShapeSettings } from './penShape'
@@ -41,7 +42,22 @@ export type ColorDetectOptions = {
   shape: ShapeSettings
   /** 手のランドマーク（手の推論が無い・使わないなら null） */
   hands: ShapeHand[] | null
+  /**
+   * 遠距離認識モード：ノイズ除去の前の色のマスクから、小さく細長い候補（遠くのペンかもしれない物）をここに集める。
+   * 全画面の検出の結果は変わらない（候補は ROI の場所を決めるだけで、ペンとは判定しない）
+   */
+  smallCandidates?: SmallCandidate[]
 }
+
+/** 遠距離認識の ROI の候補：ノイズ除去の前のマスクで見つけた、小さく細長い色の領域（処理解像度の座標） */
+export type SmallCandidate = { center: { x: number; y: number }; length: number; area: number; aspect: number }
+
+/** 小さい候補の条件（処理解像度）：面積 SMALL_MIN_AREA 以上・全画面の最小面積未満、縦横比 SMALL_MIN_ASPECT 以上、長さ SMALL_MIN_LENGTH 以上 */
+const SMALL_MIN_AREA = 6
+const SMALL_MIN_ASPECT = 3
+const SMALL_MIN_LENGTH = 8
+/** 集める候補の上限（細長い・大きい順） */
+const SMALL_MAX_CANDIDATES = 8
 
 /** 色ごとのマスクと、inRange の範囲（毎フレーム作り直さないよう色ごとに保持） */
 type ColorMats = {
@@ -90,6 +106,11 @@ type FrameMats = {
 }
 
 const KERNEL_SIZE = 5
+/** 遠距離認識の ROI の候補として拾う輪郭の最小面積（ROI の画像の px²） */
+const ROI_MIN_SEGMENT_AREA_PX = 6
+
+/** 遠距離認識の ROI 用の Mat（ROI_IMAGE_SIZE 四方に固定して使い回す） */
+type RoiMats = { rgba: Mat; rgb: Mat; hsv: Mat; colors: Map<string, ColorMats> }
 /** 結合候補として拾う輪郭の最小面積（minArea に対する比率）。指の間から覗く短い根元も拾うため小さめにする */
 const SEGMENT_AREA_RATIO = 0.2
 const MIN_SEGMENT_AREA_PX = 30
@@ -102,6 +123,9 @@ const MIN_SEGMENT_AREA_PX = 30
 export class PenDetector {
   private readonly cv: OpenCv
   private readonly kernel: Mat
+  /** 遠距離認識の ROI のノイズ除去（細いペンを消さない小さいクロージングだけ） */
+  private roiKernel: Mat | null = null
+  private roiMats: RoiMats | null = null
   private mats: FrameMats | null = null
   private colorMats = new Map<string, ColorMats>()
   private overlay: Mat | null = null
@@ -190,7 +214,7 @@ export class PenDetector {
 
     const all: ColoredDetection[] = []
     for (const color of colors) {
-      const cm = this.colorMask(color, m, settings.minArea)
+      const cm = this.colorMask(color, m, settings.minArea, options.smallCandidates)
       if (!cm.present) continue
       const maskData = cm.mask.data as Uint8Array
       const segments = this.extractSegments(cm.mask, settings)
@@ -209,6 +233,93 @@ export class PenDetector {
     }
     if (colors.length <= 1) return all
     return dedupeAcrossColors(all).slice(0, maxPens)
+  }
+
+  /**
+   * 遠距離認識モード：ROI の画像（ROI_IMAGE_SIZE 四方。カメラの映像から切り出したもの）から小さいペンを探す。
+   * 結果は処理解像度の座標（roiToFrame）に戻して返す。判定は全画面より厳しい（FAR_CRITERIA、形状判定は常に使う）。
+   * hands は処理解像度の座標。frameWidth / frameHeight は処理解像度の大きさ。
+   */
+  detectInRoi(
+    image: ImageData,
+    roi: Roi,
+    frameWidth: number,
+    frameHeight: number,
+    settings: FilterSettings & MergeSettings,
+    colors: PenColor[],
+    maxPens: number,
+    options: ColorDetectOptions,
+  ): ColoredDetection[] {
+    if (this.disposed) throw new Error('PenDetector is disposed')
+    if (image.width !== ROI_IMAGE_SIZE || image.height !== ROI_IMAGE_SIZE) throw new Error('ROI の画像の大きさが違います')
+    const cv = this.cv
+    const m = this.ensureRoiMats()
+    m.rgba.data.set(image.data)
+    cv.cvtColor(m.rgba, m.rgb, cv.COLOR_RGBA2RGB)
+    cv.cvtColor(m.rgb, m.hsv, cv.COLOR_RGB2HSV)
+    const k = roiScale(roi)
+    // ROI の画像の px に換算した条件
+    const roiSettings = { ...settings, minArea: FAR_CRITERIA.minArea / (k * k), minAspectRatio: FAR_CRITERIA.minAspect }
+    const toRoi = (p: { x: number; y: number }) => ({ x: (p.x - roi.x) / k, y: (p.y - roi.y) / k })
+    const hands = options.shape.useHands && options.hands ? options.hands.map((h) => ({ points: h.points.map(toRoi), scale: h.scale / k })) : null
+    // 面積・太さの比率は、ROI ではなく画面全体（ROI の画像の px に換算）に対して測る
+    const ratioFrame = { width: frameWidth / k, height: frameHeight / k }
+    const all: ColoredDetection[] = []
+    for (const color of colors) {
+      const cm = this.roiColorMask(color, m)
+      if (cv.countNonZero(cm.mask) < roiSettings.minArea) continue
+      const maskData = cm.mask.data as Uint8Array
+      const segments = this.extractSegments(cm.mask, roiSettings, ROI_MIN_SEGMENT_AREA_PX)
+      const minScore = FAR_CRITERIA.minScore + (color.achromatic ? ACHROMATIC_SCORE_PENALTY : 0)
+      const evaluate = (pen: PenDetection) => {
+        if (!insideRoi(pen)) return null
+        const score = scorePenShape(pen, maskData, hands, ratioFrame)
+        return score.total >= minScore ? score : null
+      }
+      for (const r of findScoredPens(segments, roiSettings, ROI_IMAGE_SIZE, ROI_IMAGE_SIZE, maxPens, evaluate)) {
+        const pen = roiToFrame(r.pen, roi, frameWidth, frameHeight)
+        if (passesFarCriteria(pen)) all.push({ pen, colorId: color.id, score: r.score })
+      }
+    }
+    return colors.length <= 1 ? all : dedupeAcrossColors(all).slice(0, maxPens)
+  }
+
+  private ensureRoiMats(): RoiMats {
+    if (this.roiMats) return this.roiMats
+    const cv = this.cv
+    const n = ROI_IMAGE_SIZE
+    this.roiKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(FAR_CRITERIA.closeKernel, FAR_CRITERIA.closeKernel))
+    this.roiMats = { rgba: new cv.Mat(n, n, cv.CV_8UC4), rgb: new cv.Mat(n, n, cv.CV_8UC3), hsv: new cv.Mat(n, n, cv.CV_8UC3), colors: new Map() }
+    return this.roiMats
+  }
+
+  /** ROI の色のマスク（オープニングはせず、小さいクロージングだけ。細い・小さいペンを消さない） */
+  private roiColorMask(color: PenColor, m: RoiMats): ColorMats {
+    const cv = this.cv
+    const n = ROI_IMAGE_SIZE
+    let cm = m.colors.get(color.id)
+    if (!cm) {
+      const mat = (type: number) => new cv.Mat(n, n, type)
+      cm = { mask: mat(cv.CV_8UC1), maskAlt: mat(cv.CV_8UC1), lower: mat(cv.CV_8UC3), upper: mat(cv.CV_8UC3), lowerAlt: mat(cv.CV_8UC3), upperAlt: mat(cv.CV_8UC3), rangeKey: '' }
+      m.colors.set(color.id, cm)
+    }
+    const s = color.hsv
+    const wraps = s.hMin > s.hMax
+    const key = `${s.hMin},${s.hMax},${s.sMin},${s.sMax},${s.vMin},${s.vMax}`
+    if (key !== cm.rangeKey) {
+      cm.rangeKey = key
+      cm.lower.setTo(new cv.Scalar(s.hMin, s.sMin, s.vMin, 0))
+      cm.upper.setTo(new cv.Scalar(wraps ? 179 : s.hMax, s.sMax, s.vMax, 0))
+      cm.lowerAlt.setTo(new cv.Scalar(0, s.sMin, s.vMin, 0))
+      cm.upperAlt.setTo(new cv.Scalar(s.hMax, s.sMax, s.vMax, 0))
+    }
+    cv.inRange(m.hsv, cm.lower, cm.upper, cm.mask)
+    if (wraps) {
+      cv.inRange(m.hsv, cm.lowerAlt, cm.upperAlt, cm.maskAlt)
+      cv.bitwise_or(cm.mask, cm.maskAlt, cm.mask)
+    }
+    cv.morphologyEx(cm.mask, cm.mask, cv.MORPH_CLOSE, this.roiKernel!)
+    return cm
   }
 
   /** 色ごとのマスクを色分けした RGBA 画像（デバッグ用の「色マスク」表示）。detectColors の後に呼ぶ */
@@ -234,7 +345,7 @@ export class PenDetector {
    * 色のマスクを作る。範囲に入る画素がペン 1 本分（最小面積）に満たない色は、
    * ノイズ除去と輪郭抽出を省略する（present = false。全色同時認識の負荷を下げるため）。
    */
-  private colorMask(color: PenColor, m: FrameMats, minArea: number): ColorMats & { present: boolean } {
+  private colorMask(color: PenColor, m: FrameMats, minArea: number, small?: SmallCandidate[]): ColorMats & { present: boolean } {
     const cv = this.cv
     let cm = this.colorMats.get(color.id)
     if (!cm) {
@@ -266,7 +377,10 @@ export class PenDetector {
       cv.inRange(m.hsv, cm.lowerAlt, cm.upperAlt, cm.maskAlt)
       cv.bitwise_or(cm.mask, cm.maskAlt, cm.mask)
     }
-    if (cv.countNonZero(cm.mask) < minArea) {
+    const count = cv.countNonZero(cm.mask)
+    // 遠距離認識モード：ノイズ除去（細い物を消すオープニング）の前のマスクから、小さく細長い候補を集める
+    if (small && count >= SMALL_MIN_AREA) this.collectSmall(cm.mask, minArea, small)
+    if (count < minArea) {
       cm.mask.setTo(new cv.Scalar(0))
       return { ...cm, present: false }
     }
@@ -275,18 +389,57 @@ export class PenDetector {
     return { ...cm, present: true }
   }
 
+  /** マスク（変更しない）から、小さく細長い輪郭を集める（遠距離認識の ROI の候補） */
+  private collectSmall(mask: Mat, minArea: number, out: SmallCandidate[]): void {
+    const cv = this.cv
+    const contours = new cv.MatVector()
+    const hierarchy = new cv.Mat()
+    try {
+      // OpenCV 3.2 以降の findContours は入力の画像を変更しない
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+      for (let i = 0; i < contours.size(); i++) {
+        const c = contours.get(i)
+        try {
+          const area = cv.contourArea(c)
+          if (area < SMALL_MIN_AREA || area >= minArea) continue
+          const r = cv.minAreaRect(c)
+          const length = Math.max(r.size.width, r.size.height)
+          const aspect = length / Math.max(Math.min(r.size.width, r.size.height), 1)
+          if (length < SMALL_MIN_LENGTH || aspect < SMALL_MIN_ASPECT) continue
+          out.push({ center: { x: r.center.x, y: r.center.y }, length, area, aspect })
+        } finally {
+          c.delete()
+        }
+      }
+    } finally {
+      contours.delete()
+      hierarchy.delete()
+    }
+    out.sort((a, b) => b.aspect * b.area - a.aspect * a.area)
+    out.splice(SMALL_MAX_CANDIDATES)
+  }
+
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
     this.releaseMats()
     this.kernel.delete()
+    if (this.roiMats) {
+      for (const mat of [this.roiMats.rgba, this.roiMats.rgb, this.roiMats.hsv]) mat.delete()
+      for (const cm of this.roiMats.colors.values()) {
+        for (const mat of [cm.mask, cm.maskAlt, cm.lower, cm.upper, cm.lowerAlt, cm.upperAlt]) mat.delete()
+      }
+      this.roiMats = null
+    }
+    this.roiKernel?.delete()
+    this.roiKernel = null
   }
 
-  private extractSegments(mask: Mat, settings: FilterSettings): PenSegment[] {
+  private extractSegments(mask: Mat, settings: FilterSettings, minSegmentPx = MIN_SEGMENT_AREA_PX): PenSegment[] {
     const cv = this.cv
     const contours = new cv.MatVector()
     const hierarchy = new cv.Mat()
-    const minSegmentArea = Math.max(settings.minArea * SEGMENT_AREA_RATIO, MIN_SEGMENT_AREA_PX)
+    const minSegmentArea = Math.max(settings.minArea * SEGMENT_AREA_RATIO, minSegmentPx)
     const segments: PenSegment[] = []
     try {
       cv.findContours(

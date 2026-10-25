@@ -9,14 +9,17 @@ import type { HandSample } from '../src/lib/snapDetector.ts'
 type P = { x: number; y: number }
 const FRAME = 33
 
-/** 右手の合成姿勢（snapDetector.test.ts と同じ形）。thumbAt に親指の先端が来るよう平行移動する */
-function hand(phase: 'press' | 'snapped' | 'open', thumbAt: P, time: number): TrackedHand {
-  const at = (x: number, y: number): P => ({ x: thumbAt.x + 60 + x, y: thumbAt.y + 55 + y })
-  const middle = { press: at(-55, -75), snapped: at(-25, 15), open: at(-5, -140) }[phase]
+/**
+ * 右手の合成姿勢。STEP 10：press は親指と人差し指の先端をくっつけた状態、snapped / open は人差し指を離した状態
+ * （人差し指の先端は親指の先端の 80px 上。炎はそこに出る）。tipAt に「離した人差し指の先端」が来るよう平行移動する
+ */
+function hand(phase: 'press' | 'snapped' | 'open', tipAt: P, time: number): TrackedHand {
+  const at = (x: number, y: number): P => ({ x: tipAt.x + 60 + x, y: tipAt.y + 135 + y })
+  const index = phase === 'press' ? at(-57, -50) : at(-60, -135)
   const sample: HandSample = {
     time,
     thumbTip: at(-60, -55),
-    middleTip: middle,
+    indexTip: index,
     wrist: at(0, 60),
     indexMcp: at(-30, -40),
     pinkyMcp: at(35, -30),
@@ -50,9 +53,9 @@ function lighterAt(cx: number, cy: number): PenDetection {
 }
 
 describe('FireController', () => {
-  it('指パッチンで親指の先に炎が出て、火側の端が近ければ着火する', () => {
+  it('着火ジェスチャーで人差し指の先に炎が出て、火側の端が近ければ着火する', () => {
     const fire = new FireController()
-    const thumb = { x: 320, y: 340 } // 炎の胴体が火側の端の近くに来る位置
+    const thumb = { x: 320, y: 340 } // 炎の胴体が火側の端の近くに来る位置（人差し指の先端）
     let t = 0
     for (let i = 0; i < 4; i++) fire.update(input((t += FRAME), { hands: [hand('press', thumb, t)] }))
     const snapped = fire.update(input((t += FRAME), { hands: [hand('snapped', thumb, t)] }))
@@ -69,7 +72,7 @@ describe('FireController', () => {
     let t = 0
     let last
     for (let i = 0; i < 60; i++) last = fire.update(input((t += FRAME), { hands: [hand(i % 2 ? 'open' : 'press', { x: 320, y: 340 }, t)] }))
-    // 押す・開くを交互に繰り返しても、弾く動き（中指が手のひら側へ）が無ければ判定しない
+    // くっつける・開くを 1 フレームずつ繰り返しても、接触の時間が短いので判定しない
     assert.equal(last!.flames.length, 0)
     assert.equal(last!.ignition.state, 'UNLIT')
   })
@@ -92,7 +95,7 @@ describe('FireController', () => {
     for (let i = 0; i < 4; i++) fire.update(input((t += FRAME), { hands: [hand('press', { x: 500, y: 100 }, t)] }))
     fire.update(input((t += FRAME), { hands: [hand('snapped', { x: 500, y: 100 }, t)] }))
     const moved = fire.update(input((t += FRAME), { hands: [hand('open', { x: 520, y: 140 }, t)] }))
-    assert.ok(Math.abs(moved.flames[0].position.x - 520) < 1, '炎が親指の先に追従')
+    assert.ok(Math.abs(moved.flames[0].position.x - 520) < 1, '炎が人差し指の先に追従')
     const later = fire.update(input(t + SNAP_FLAME_MS + 100, { hands: [] }))
     assert.equal(later.flames.length, 0)
   })
