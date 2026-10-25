@@ -45,6 +45,8 @@ import { canvasToJpeg, composePhoto, drawVideoFrame, photoFileName } from '../li
 import { savePhoto } from '../lib/photoSaver'
 import { scaleFace, type PosterFace } from '../lib/posterRenderer'
 import { PosterEditor } from './PosterEditor'
+import { GuideScreen } from './GuideScreen'
+import { TabBar, type Screen } from './TabBar'
 import type { SnapAttempt, SnapDebug } from '../lib/snapDetector'
 import {
   PersonController,
@@ -289,8 +291,8 @@ export function PenTracker() {
   const [capturing, setCapturing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [toast, setToast] = useState<Toast | null>(null)
-  /** 詳細設定（従来の設定欄）を開いているか。iPhone の縦画面では最初は閉じる */
-  const [settingsOpen, setSettingsOpen] = useState(() => typeof window === 'undefined' || window.matchMedia('(min-width: 861px)').matches)
+  /** STEP 15：表示中の画面（撮る / 設定 / 遊び方）。数値の調整は「設定」だけに出す */
+  const [screen, setScreen] = useState<Screen>('camera')
   /** STEP 10：開発者向けの表示（デバッグ・調整）。通常のデモでは隠す */
   const [devMode, setDevMode] = useState(false)
   /** 遠距離認識モード（初期値 OFF） */
@@ -1145,7 +1147,7 @@ export function PenTracker() {
   const updateFire = (patch: Partial<FireSettings>) => setFire((prev) => ({ ...prev, ...patch }))
 
   return (
-    <div className="pen-tracker">
+    <div className={`pen-tracker screen-${screen}${running ? '' : ' is-idle'}`}>
       <div className="main-column">
       {/* STEP 9：上部の操作（フィルター・カメラの切り替え） */}
       <div className="top-bar">
@@ -1168,7 +1170,7 @@ export function PenTracker() {
       </div>
       {/* 映像の比率に枠を合わせる（iOS 対応：縦向きの iPhone で映像が小さくならないように。起動前は 16:9） */}
       <div
-        className="stage"
+        className={`stage${running ? '' : ' idle'}`}
         style={stats.frameWidth > 0 && stats.frameHeight > 0 ? { aspectRatio: `${stats.frameWidth} / ${stats.frameHeight}` } : undefined}
       >
         <video ref={videoRef} className="source-video" playsInline muted />
@@ -1201,10 +1203,10 @@ export function PenTracker() {
         {toast && !previewOpen && <div className={`toast toast-${toast.kind}`} role="status">{toast.text}</div>}
         {running && personMode === 1 && (
           <div className="stage-badges" aria-live="polite">
-            <div className={`smoke-badge ignition-${ignitionState.toLowerCase()}`}>{ignitionState}</div>
+            <div className={`smoke-badge ignition-${ignitionState.toLowerCase()}`}>{STATE_LABELS[ignitionState] ?? ignitionState}</div>
             {smoke.enabled && stats.smoke && (
               <div className={`smoke-badge state-${stats.smoke.state.toLowerCase()}`}>
-                {stats.smoke.state}
+                {STATE_LABELS[stats.smoke.state] ?? stats.smoke.state}
                 {stats.smoke.exhaleReady && stats.smoke.state !== 'EXHALING' && <span> · 吐ける</span>}
               </div>
             )}
@@ -1224,19 +1226,32 @@ export function PenTracker() {
                   className={`smoke-badge person-badge ignition-${p.ignition.toLowerCase()}`}
                   style={{ borderColor: personColor(p.id) }}
                 >
-                  <span style={{ color: personColor(p.id) }}>#{p.id}</span> {p.ignition}
-                  {smoke.enabled && p.ignition === 'LIT' && ` · ${p.smoke}`}
+                  <span style={{ color: personColor(p.id) }}>#{p.id}</span> {STATE_LABELS[p.ignition] ?? p.ignition}
+                  {smoke.enabled && p.ignition === 'LIT' && ` · ${STATE_LABELS[p.smoke] ?? p.smoke}`}
                 </div>
               ))}
             {stats.flames.length > 0 && <div className="smoke-badge flame-on">炎</div>}
           </div>
         )}
         {!running && (
-          <div className="stage-placeholder">
-            {cvStatus === 'loading' && 'OpenCV.js を読み込み中…'}
-            {cvStatus === 'error' && `OpenCV.js の読み込みに失敗しました: ${cvError}`}
-            {cvStatus === 'ready' &&
-              (cameraStatus === 'starting' ? 'カメラを起動中…' : 'カメラは停止中です')}
+          <div className="stage-home">
+            <div className="vtitle">
+              <h1>シブガレット</h1>
+              <span className="vtitle-seal" aria-hidden="true">
+                渋
+              </span>
+            </div>
+            <p className="home-lead">
+              ペンを、一本のタバコに。
+              <br />
+              指を鳴らして、火を灯す。
+            </p>
+            <button type="button" className="btn-primary big" onClick={startCamera} disabled={cvStatus !== 'ready' || cameraStatus === 'starting'}>
+              {cameraStatus === 'starting' ? 'カメラを起動中…' : 'カメラを起動'}
+            </button>
+            {cvStatus === 'loading' && <p className="home-status">準備中（画像処理を読み込んでいます）…</p>}
+            {cvStatus === 'error' && <p className="home-status error">画像処理の読み込みに失敗しました：{cvError}</p>}
+            {error && <p className="home-status error">{error}</p>}
           </div>
         )}
       </div>
@@ -1247,9 +1262,8 @@ export function PenTracker() {
             カメラ停止
           </button>
         ) : (
-          <button type="button" className="camera-toggle" onClick={startCamera} disabled={cvStatus !== 'ready'}>
-            カメラ起動
-          </button>
+          // 起動は映像の上の「カメラを起動」から（下部の左は空けておく）
+          <span />
         )}
         <button
           type="button"
@@ -1275,8 +1289,13 @@ export function PenTracker() {
       </div>
       </div>
 
-      <details className="settings" open={settingsOpen} onToggle={(e) => setSettingsOpen(e.currentTarget.open)}>
-      <summary>詳細設定</summary>
+      {/* STEP 15：設定の画面（数値・判定の調整）。上に小さく映像を出したまま調整できる */}
+      {screen === 'settings' && (
+      <section className="settings-screen" aria-label="設定">
+      <header className="page-head">
+        <h1>設定</h1>
+        <p>判定の数値や色の調整。上の映像で効き目を確かめながら変えられます。</p>
+      </header>
       <div className="panel">
         <label className="checkbox dev-toggle">
           <input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} />
@@ -2383,7 +2402,11 @@ export function PenTracker() {
           </label>
         </section>
       </div>
-      </details>
+      </section>
+      )}
+
+      {screen === 'guide' && <GuideScreen onClose={() => setScreen('camera')} />}
+      <TabBar current={screen} onSelect={setScreen} />
 
       {/* STEP 9：撮影した写真のプレビュー（保存 / 撮り直す） */}
       {previewOpen && photo?.url && (
@@ -2495,6 +2518,15 @@ function handsWanted(fire: FireSettings, shape: ShapeSettings): boolean {
 function colorLabel(colors: PenColor[], pen: IdentifiedPen): string {
   const name = colors.find((c) => c.id === pen.colorId)?.name ?? ''
   return `P${pen.id} ${name}${pen.score !== null ? ` ${pen.score.toFixed(2)}` : ''}`
+}
+
+/** STEP 15：撮る画面の状態の表示（着火・煙の状態を日本語で） */
+const STATE_LABELS: Record<string, string> = {
+  UNLIT: '未着火',
+  LIT: '着火中',
+  IDLE: '待機',
+  SMOKING: '吸っている',
+  EXHALING: '吐いている',
 }
 
 /** STEP 10：表示用のラベル */

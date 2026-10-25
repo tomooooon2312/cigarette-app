@@ -37,10 +37,25 @@ function posterCopyApi(env: Record<string, string>): Plugin {
   }
 }
 
+/**
+ * STEP 15：@fontsource の CSS から、古い形式の woff の指定を除く（woff2 だけを同梱する）。
+ * iPhone の WKWebView・現在のブラウザは woff2 に対応しているので、woff は使われないのにアプリの大きさだけが増えるため。
+ */
+function fontsourceWoff2Only(): Plugin {
+  return {
+    name: 'fontsource-woff2-only',
+    enforce: 'pre',
+    transform(code, id) {
+      if (!id.includes('/@fontsource/') || !id.endsWith('.css')) return
+      return code.replace(/,\s*url\([^)]*\.woff\)\s*format\(['"]woff['"]\)/g, '')
+    },
+  }
+}
+
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   return {
-    plugins: [react(), fullReloadOnLibChange(), posterCopyApi(env)],
+    plugins: [fontsourceWoff2Only(), react(), fullReloadOnLibChange(), posterCopyApi(env)],
   }
 })
